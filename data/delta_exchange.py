@@ -27,33 +27,15 @@ class DeltaDataClient:
     }
 
     def get_candles(
-        self,
-        symbol: str,
-        resolution: str = "5m",
-        limit: int = 200,
-        end_time: Optional[datetime] = None,
-        tz: str = "UTC",
+            self,
+            symbol: str,
+            resolution: str = "5m",
+            limit: int = 200,
+            end_time: Optional[datetime] = None,
+            tz: str = "UTC",
     ) -> pd.DataFrame:
         """
         Fetch historical OHLCV candles.
-
-        Parameters
-        ----------
-        symbol : str
-            Market symbol (e.g. BTCUSD)
-        resolution : str
-            Candle timeframe (e.g. 1m, 5m, 1h)
-        limit : int
-            Number of candles to fetch
-        end_time : datetime, optional
-            Fetch candles up to this time (defaults to now)
-        tz : str
-            Timezone for returned timestamps
-
-        Returns
-        -------
-        pd.DataFrame
-            Columns: timestamp, open, high, low, close, volume
         """
 
         if resolution not in self.RESOLUTION_MINUTES:
@@ -71,6 +53,13 @@ class DeltaDataClient:
         start_time = end_time - timedelta(
             minutes=(limit - 1) * minutes_per_candle
         )
+
+        # --------------------------------------------------
+        # 🔒 Windows-safe timestamp floor
+        # --------------------------------------------------
+        MIN_START = datetime(2018, 1, 1)
+        if start_time < MIN_START:
+            start_time = MIN_START
 
         params = {
             "symbol": symbol,
@@ -104,6 +93,7 @@ class DeltaDataClient:
         df = df.sort_values("timestamp").reset_index(drop=True)
 
         return df
+
 
     def get_ticker(self, symbol: str) -> dict:
         """

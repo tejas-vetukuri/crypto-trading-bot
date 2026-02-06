@@ -7,7 +7,7 @@ def main():
     model, history, results_df = train_lstm_model(
         symbol="BTCUSD",
         resolution="5m",
-        limit=1000,          # small for quick test
+        limit= 100000000,          # small for quick test
         sequence_length=20,
         epochs=3,            # quick sanity run
         batch_size=64,
