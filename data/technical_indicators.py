@@ -1,20 +1,21 @@
 import pandas as pd
 
+
 class TechnicalIndicators:
 
     @staticmethod
     def calculate_ema(
-        df: pd.DataFrame,
-        span: int,
-        col: str = "close"
+            df: pd.DataFrame,
+            span: int,
+            col: str = "close"
     ) -> pd.Series:
         return df[col].ewm(span=span, adjust=False).mean()
 
     @staticmethod
     def calculate_rsi(
-        df: pd.DataFrame,
-        period: int = 14,
-        col: str = "close"
+            df: pd.DataFrame,
+            period: int = 14,
+            col: str = "close"
     ) -> pd.Series:
         delta = df[col].diff()
 
@@ -38,8 +39,8 @@ class TechnicalIndicators:
 
     @staticmethod
     def calculate_atr(
-        df: pd.DataFrame,
-        period: int = 14
+            df: pd.DataFrame,
+            period: int = 14
     ) -> pd.Series:
         high = df["high"]
         low = df["low"]

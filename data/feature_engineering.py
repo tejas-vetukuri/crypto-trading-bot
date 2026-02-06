@@ -1,5 +1,5 @@
 import numpy as np
-from technical_indicators import TechnicalIndicators
+from data.technical_indicators import TechnicalIndicators
 
 def feature_engineering(df):
     df["ema_20"] = TechnicalIndicators.calculate_ema(df, 20)
@@ -10,3 +10,4 @@ def feature_engineering(df):
     df["volatility_5"] = df["close"].rolling(5).std()
     df["actual_trend"] = np.where(df["close"] > df["close"].shift(1), "up", "down")
     df.dropna(inplace=True)     # Handle missing values
+    return df
