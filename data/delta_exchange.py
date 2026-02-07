@@ -2,14 +2,10 @@ import requests
 import pandas as pd
 from datetime import datetime, timedelta
 from typing import Optional
+from pathlib import Path
 
 
 class DeltaDataClient:
-    """
-    Synchronous Delta Exchange market data client.
-    Safe for backtesting, research, and live trading.
-    """
-
     BASE_URL = "https://api.delta.exchange"
 
     RESOLUTION_MINUTES = {
@@ -26,40 +22,23 @@ class DeltaDataClient:
         "1w": 10080,
     }
 
-    def get_candles(
-            self,
-            symbol: str,
-            resolution: str = "5m",
-            limit: int = 200,
-            end_time: Optional[datetime] = None,
-            tz: str = "UTC",
+    MAX_CANDLES_PER_REQUEST = 1000   # Delta hard cap
+    DATA_DIR = Path("data/candles")
+
+    def __init__(self):
+        self.DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    # --------------------------------------------------
+    # Internal single-request fetch
+    # --------------------------------------------------
+    def _fetch_candles_chunk(
+        self,
+        symbol: str,
+        resolution: str,
+        start_time: datetime,
+        end_time: datetime,
+        tz: str,
     ) -> pd.DataFrame:
-        """
-        Fetch historical OHLCV candles.
-        """
-
-        if resolution not in self.RESOLUTION_MINUTES:
-            raise ValueError(f"Unsupported resolution: {resolution}")
-
-        minutes_per_candle = self.RESOLUTION_MINUTES[resolution]
-
-        if end_time is None:
-            end_time = datetime.utcnow()
-
-        # Ensure only CLOSED candles are used
-        end_time = end_time.replace(second=0, microsecond=0)
-        end_time -= timedelta(minutes=minutes_per_candle)
-
-        start_time = end_time - timedelta(
-            minutes=(limit - 1) * minutes_per_candle
-        )
-
-        # --------------------------------------------------
-        # 🔒 Windows-safe timestamp floor
-        # --------------------------------------------------
-        MIN_START = datetime(2018, 1, 1)
-        if start_time < MIN_START:
-            start_time = MIN_START
 
         params = {
             "symbol": symbol,
@@ -69,7 +48,6 @@ class DeltaDataClient:
         }
 
         url = f"{self.BASE_URL}/v2/history/candles"
-
         response = requests.get(url, params=params, timeout=10)
         response.raise_for_status()
 
@@ -79,32 +57,85 @@ class DeltaDataClient:
 
         df = pd.DataFrame(data["result"]).rename(columns={"time": "timestamp"})
 
-        # Timestamp handling
         df["timestamp"] = (
             pd.to_datetime(df["timestamp"], unit="s")
             .dt.tz_localize("UTC")
             .dt.tz_convert(tz)
         )
 
-        # Numeric safety
         for col in ["open", "high", "low", "close", "volume"]:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-        df = df.sort_values("timestamp").reset_index(drop=True)
+        return df.sort_values("timestamp")
 
-        return df
+    # --------------------------------------------------
+    # Public cached + paginated fetch
+    # --------------------------------------------------
+    def get_candles(
+        self,
+        symbol: str,
+        resolution: str = "5m",
+        limit: int = 5000,
+        tz: str = "UTC",
+        force_refresh: bool = False,
+    ) -> pd.DataFrame:
 
+        if resolution not in self.RESOLUTION_MINUTES:
+            raise ValueError(f"Unsupported resolution: {resolution}")
 
-    def get_ticker(self, symbol: str) -> dict:
-        """
-        Fetch latest market ticker data.
-        """
-        url = f"{self.BASE_URL}/v2/tickers/{symbol}"
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
+        csv_path = self.DATA_DIR / f"{symbol}_{resolution}.csv"
 
-        data = response.json()
-        if "result" not in data:
-            raise RuntimeError("Invalid ticker response")
+        # -----------------------------
+        # Load cached data if available
+        # -----------------------------
+        if csv_path.exists() and not force_refresh:
+            df = pd.read_csv(csv_path, parse_dates=["timestamp"])
+            df["timestamp"] = df["timestamp"].dt.tz_convert(tz)
 
-        return data["result"]
+            if len(df) >= limit:
+                return df.tail(limit).reset_index(drop=True)
+
+            candles_needed = limit - len(df)
+            end_time = df["timestamp"].min().to_pydatetime()
+            all_dfs = [df]
+        else:
+            candles_needed = limit
+            end_time = datetime.utcnow()
+            all_dfs = []
+
+        minutes_per_candle = self.RESOLUTION_MINUTES[resolution]
+
+        # -----------------------------
+        # Pagination loop
+        # -----------------------------
+        while candles_needed > 0:
+            chunk_size = min(self.MAX_CANDLES_PER_REQUEST, candles_needed)
+
+            start_time = end_time - timedelta(
+                minutes=chunk_size * minutes_per_candle
+            )
+
+            chunk = self._fetch_candles_chunk(
+                symbol, resolution, start_time, end_time, tz
+            )
+
+            if chunk.empty:
+                break
+
+            all_dfs.append(chunk)
+            candles_needed -= len(chunk)
+            end_time = chunk["timestamp"].min().to_pydatetime()
+
+        # -----------------------------
+        # Merge + deduplicate
+        # -----------------------------
+        final_df = (
+            pd.concat(all_dfs)
+            .drop_duplicates("timestamp")
+            .sort_values("timestamp")
+            .reset_index(drop=True)
+        )
+
+        final_df.to_csv(csv_path, index=False)
+
+        return final_df.tail(limit).reset_index(drop=True)
