@@ -23,7 +23,8 @@ class DeltaDataClient:
     }
 
     MAX_CANDLES_PER_REQUEST = 1000   # Delta hard cap
-    DATA_DIR = Path("data/candles")
+    PROJECT_ROOT = Path(__file__).resolve().parents[1]
+    DATA_DIR = PROJECT_ROOT / "data" / "raw"
 
     def __init__(self):
         self.DATA_DIR.mkdir(parents=True, exist_ok=True)
