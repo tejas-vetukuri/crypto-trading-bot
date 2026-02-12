@@ -11,6 +11,31 @@ from sklearn.metrics import (
 from models.lstm.lstm import train_lstm_model
 
 
+def print_sample_distribution(results_df):
+    """
+    Print class distribution statistics.
+    """
+
+    print("\n📊 ================= SAMPLE DISTRIBUTION =================")
+
+    # Overall test distribution (actual)
+    print("\n🔹 Actual Class Distribution (Test Set):")
+    actual_dist = results_df["actual"].value_counts(normalize=True)
+    print(actual_dist)
+
+    # Predicted distribution
+    print("\n🔹 Predicted Class Distribution:")
+    pred_dist = results_df["pred"].value_counts(normalize=True)
+    print(pred_dist)
+
+    # Raw counts
+    print("\n🔹 Raw Counts (Actual):")
+    print(results_df["actual"].value_counts())
+
+    print("\n🔹 Raw Counts (Predicted):")
+    print(results_df["pred"].value_counts())
+
+
 def evaluate_results(results_df):
     """
     Perform full evaluation of LSTM test predictions.
@@ -50,7 +75,7 @@ True Positives  (Correct UP):   {tp}
     print(classification_report(y_true, y_pred, target_names=["DOWN", "UP"]))
 
     # -----------------------------
-    # ROC-AUC (better computed using probabilities ideally)
+    # ROC-AUC
     # -----------------------------
     try:
         auc = roc_auc_score(y_true, y_pred)
@@ -61,8 +86,7 @@ True Positives  (Correct UP):   {tp}
     # -----------------------------
     # Prediction distribution
     # -----------------------------
-    print("\n📊 Prediction Distribution:")
-    print(results_df["pred"].value_counts(normalize=True))
+    print_sample_distribution(results_df)
 
 
 def main():
@@ -71,8 +95,8 @@ def main():
     model, history, results_df = train_lstm_model(
         symbol="BTCUSD",
         resolution="4h",
-        start_date="2024-01-01",   # ← explicit time window
-        end_date=None,             # fetch until now
+        start_date="2019-01-01",
+        end_date=None,
         sequence_length=20,
         epochs=5,
         batch_size=64,
