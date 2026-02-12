@@ -50,7 +50,7 @@ True Positives  (Correct UP):   {tp}
     print(classification_report(y_true, y_pred, target_names=["DOWN", "UP"]))
 
     # -----------------------------
-    # ROC-AUC
+    # ROC-AUC (better computed using probabilities ideally)
     # -----------------------------
     try:
         auc = roc_auc_score(y_true, y_pred)
@@ -71,7 +71,8 @@ def main():
     model, history, results_df = train_lstm_model(
         symbol="BTCUSD",
         resolution="4h",
-        limit=100000,
+        start_date="2024-01-01",   # ← explicit time window
+        end_date=None,             # fetch until now
         sequence_length=20,
         epochs=5,
         batch_size=64,

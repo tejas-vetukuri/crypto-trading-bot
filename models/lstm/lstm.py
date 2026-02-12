@@ -15,24 +15,28 @@ from models.lstm.sequence_builder import make_sequences
 def train_lstm_model(
     symbol: str = "BTCUSD",
     resolution: str = "5m",
-    limit: int = 5000,
+    start_date: str = "2024-01-01",
+    end_date: str = None,
     sequence_length: int = 20,
     epochs: int = 10,
     batch_size: int = 64,
     model_path: str = "lstm_model.h5"
 ):
     """
-    Train an LSTM model for next-candle direction prediction.
+    Train an LSTM model for next-candle direction prediction
+    using time-bounded historical data.
     """
 
     # -----------------------------
-    # Fetch historical data
+    # Fetch historical data (time-based)
     # -----------------------------
     client = DeltaDataClient()
+
     df = client.get_candles(
         symbol=symbol,
         resolution=resolution,
-        limit=limit
+        start_date=start_date,
+        end_date=end_date
     )
 
     # -----------------------------
@@ -49,6 +53,8 @@ def train_lstm_model(
         "volatility_5",
     ]
 
+    df = df.dropna().reset_index(drop=True)
+
     X = df[features].values
     y = df["actual_trend"].values  # "up" / "down"
 
@@ -59,7 +65,7 @@ def train_lstm_model(
     y = le.fit_transform(y)  # down=0, up=1
 
     # -----------------------------
-    # Chronological split
+    # Chronological split (70/15/15)
     # -----------------------------
     n = len(X)
     train_end = int(n * 0.7)
@@ -69,7 +75,7 @@ def train_lstm_model(
     y_train, y_val, y_test = y[:train_end], y[train_end:val_end], y[val_end:]
 
     # -----------------------------
-    # Scale features
+    # Scale features (fit ONLY on train)
     # -----------------------------
     scaler = StandardScaler()
     X_train = scaler.fit_transform(X_train)
@@ -132,9 +138,8 @@ def train_lstm_model(
     y_pred_probs = model.predict(X_test_seq)
     y_pred = np.argmax(y_pred_probs, axis=1)
 
-    close_prices = df.iloc[
-        val_end + sequence_length :
-    ]["close"].values
+    # Align close prices with test sequences
+    close_prices = df.iloc[val_end + sequence_length:]["close"].values[:len(y_test_seq)]
 
     results_df = pd.DataFrame({
         "actual": y_test_seq,

@@ -22,7 +22,7 @@ class DeltaDataClient:
         "1w": 10080,
     }
 
-    MAX_CANDLES_PER_REQUEST = 1000   # Delta hard cap
+    MAX_CANDLES_PER_REQUEST = 1000  # Delta hard cap
     PROJECT_ROOT = Path(__file__).resolve().parents[1]
     DATA_DIR = PROJECT_ROOT / "data" / "raw"
 
@@ -58,9 +58,11 @@ class DeltaDataClient:
 
         df = pd.DataFrame(data["result"]).rename(columns={"time": "timestamp"})
 
+        if df.empty:
+            return df
+
         df["timestamp"] = (
-            pd.to_datetime(df["timestamp"], unit="s")
-            .dt.tz_localize("UTC")
+            pd.to_datetime(df["timestamp"], unit="s", utc=True)
             .dt.tz_convert(tz)
         )
 
@@ -70,13 +72,14 @@ class DeltaDataClient:
         return df.sort_values("timestamp")
 
     # --------------------------------------------------
-    # Public cached + paginated fetch
+    # Public time-based + paginated fetch
     # --------------------------------------------------
     def get_candles(
         self,
         symbol: str,
         resolution: str = "5m",
-        limit: int = 5000,
+        start_date: str = None,  # "YYYY-MM-DD"
+        end_date: Optional[str] = None,
         tz: str = "UTC",
         force_refresh: bool = False,
     ) -> pd.DataFrame:
@@ -84,51 +87,66 @@ class DeltaDataClient:
         if resolution not in self.RESOLUTION_MINUTES:
             raise ValueError(f"Unsupported resolution: {resolution}")
 
-        csv_path = self.DATA_DIR / f"{symbol}_{resolution}.csv"
+        if start_date is None:
+            raise ValueError("start_date must be provided (YYYY-MM-DD)")
+
+        start_time = pd.to_datetime(start_date, utc=True)
+        end_time = (
+            pd.to_datetime(end_date, utc=True)
+            if end_date
+            else pd.Timestamp.utcnow()
+        )
+
+        csv_path = self.DATA_DIR / f"{symbol}_{resolution}_{start_date}_to_{end_date or 'now'}.csv"
 
         # -----------------------------
-        # Load cached data if available
+        # Load cached data
         # -----------------------------
         if csv_path.exists() and not force_refresh:
             df = pd.read_csv(csv_path, parse_dates=["timestamp"])
             df["timestamp"] = df["timestamp"].dt.tz_convert(tz)
-
-            if len(df) >= limit:
-                return df.tail(limit).reset_index(drop=True)
-
-            candles_needed = limit - len(df)
-            end_time = df["timestamp"].min().to_pydatetime()
-            all_dfs = [df]
-        else:
-            candles_needed = limit
-            end_time = datetime.utcnow()
-            all_dfs = []
+            return df
 
         minutes_per_candle = self.RESOLUTION_MINUTES[resolution]
 
-        # -----------------------------
-        # Pagination loop
-        # -----------------------------
-        while candles_needed > 0:
-            chunk_size = min(self.MAX_CANDLES_PER_REQUEST, candles_needed)
+        current_start = start_time
+        all_dfs = []
 
-            start_time = end_time - timedelta(
-                minutes=chunk_size * minutes_per_candle
+        # -----------------------------
+        # Safe Pagination Loop
+        # -----------------------------
+        while current_start < end_time:
+
+            current_end = min(
+                current_start + timedelta(
+                    minutes=self.MAX_CANDLES_PER_REQUEST * minutes_per_candle
+                ),
+                end_time,
             )
 
             chunk = self._fetch_candles_chunk(
-                symbol, resolution, start_time, end_time, tz
+                symbol, resolution, current_start, current_end, tz
             )
 
             if chunk.empty:
                 break
 
             all_dfs.append(chunk)
-            candles_needed -= len(chunk)
-            end_time = chunk["timestamp"].min().to_pydatetime()
+
+            # Move window safely using last returned candle
+            last_timestamp = chunk["timestamp"].max()
+
+            # Convert back to UTC for next request
+            current_start = last_timestamp.tz_convert("UTC").to_pydatetime()
+
+            # Step forward one candle to prevent infinite loop
+            current_start += timedelta(minutes=minutes_per_candle)
+
+        if not all_dfs:
+            raise RuntimeError("No data returned from API for given time range.")
 
         # -----------------------------
-        # Merge + deduplicate
+        # Merge + Deduplicate
         # -----------------------------
         final_df = (
             pd.concat(all_dfs)
@@ -139,4 +157,4 @@ class DeltaDataClient:
 
         final_df.to_csv(csv_path, index=False)
 
-        return final_df.tail(limit).reset_index(drop=True)
+        return final_df
