@@ -71,7 +71,7 @@ def train_lstm_model(
     df = df.dropna().reset_index(drop=True)
 
     X = df[features].values
-    y = df["actual_trend"].values  # "up" / "down"
+    y = df["future_trend"].values  # "up" / "down"
 
     # -----------------------------
     # Encode labels

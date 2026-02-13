@@ -1,7 +1,18 @@
 import numpy as np
 from data.technical_indicators import TechnicalIndicators
 
-def feature_engineering(df):
+def feature_engineering(df, horizon=6):
+    """
+    Feature engineering for LSTM + forward-looking target
+
+    Args:
+        df (pd.DataFrame): OHLCV dataframe
+        horizon (int): Number of candles ahead to predict
+
+    Returns:
+        pd.DataFrame: dataframe with technical features, price dynamics, and future target
+    """
+
     # ==============================
     # Technical Indicators
     # ==============================
@@ -14,7 +25,7 @@ def feature_engineering(df):
     df["volatility_5"] = df["close"].rolling(5).std()
 
     # ==============================
-    # Price Dynamics (NEW)
+    # Price Dynamics
     # ==============================
 
     # Log returns
@@ -32,11 +43,16 @@ def feature_engineering(df):
     df["body_ratio"] = df["candle_body"] / (df["range"] + 1e-9)
 
     # ==============================
-    # Target
+    # Forward-Looking Target (NEW)
     # ==============================
-    df["actual_trend"] = np.where(df["close"] > df["close"].shift(1), "up", "down")
 
-    # Drop NaNs caused by shifting/rolling
+    # Calculate future return over 'horizon' candles
+    df["future_return"] = (df["close"].shift(-horizon) - df["close"]) / df["close"]
+
+    # Convert to categorical target: 1 = price up, 0 = price down
+    df["future_trend"] = np.where(df["future_return"] > 0, 1, 0)
+
+    # Drop NaNs caused by rolling/shifting
     df.dropna(inplace=True)
 
     return df

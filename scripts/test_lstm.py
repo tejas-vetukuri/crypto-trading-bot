@@ -10,6 +10,9 @@ from sklearn.metrics import (
 
 from models.lstm.lstm import train_lstm_model
 
+from models.baselines.random_baseline import RandomBaseline
+from models.baselines.majority_baseline import MajorityBaseline
+
 
 def print_sample_distribution(results_df):
     """
@@ -97,7 +100,7 @@ def main():
         resolution="4h",
         start_date="2019-01-01",
         end_date=None,
-        sequence_length=20,
+        sequence_length=100,
         epochs=5,
         batch_size=64,
         model_path="lstm_model_test.h5"
@@ -114,6 +117,26 @@ def main():
     print(results_df.head())
 
     print(f"\nTotal test samples: {len(results_df)}")
+    print("\n✅ Full evaluation completed successfully")
+
+    # -----------------------------
+    # Baseline accuracies (just summary)
+    # -----------------------------
+    y_true = results_df["actual"].values
+    X_test = results_df.drop(columns=["actual"]).values  # Needed for baseline fit interface
+
+    baselines = [
+        ("Random Baseline", RandomBaseline()),
+        ("Majority Baseline", MajorityBaseline())
+    ]
+
+    print("\n📊 ================= BASELINE ACCURACIES =================")
+    for name, baseline in baselines:
+        baseline.fit(X_test, y_true)
+        y_pred = baseline.predict(X_test)
+        acc = accuracy_score(y_true, y_pred)
+        print(f"{name} Accuracy: {acc:.4f}")
+
     print("\n✅ Full evaluation completed successfully")
 
 
