@@ -45,12 +45,27 @@ def train_lstm_model(
     df = feature_engineering(df)
 
     features = [
+        # Raw
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+
+        # Price dynamics
+        "returns",
+        "candle_body",
+        "upper_wick",
+        "lower_wick",
+
+        # Regime
+        "volatility_5",
+
+        # Light indicators
         "ema_20",
         "ema_50",
         "rsi",
         "atr",
-        "momentum_3",
-        "volatility_5",
     ]
 
     df = df.dropna().reset_index(drop=True)
