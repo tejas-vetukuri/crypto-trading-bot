@@ -100,8 +100,8 @@ def main():
         resolution="4h",
         start_date="2019-01-01",
         end_date=None,
-        sequence_length=100,
-        epochs=5,
+        sequence_length=20,
+        epochs=10,
         batch_size=64,
         model_path="lstm_model_test.h5"
     )

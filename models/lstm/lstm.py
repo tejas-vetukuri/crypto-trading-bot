@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 
-from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.preprocessing import MinMaxScaler, LabelEncoder
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout
 from tensorflow.keras.utils import to_categorical
@@ -24,20 +24,14 @@ def train_lstm_model(
 ):
     """
     Train an LSTM model for next-candle direction prediction
-    using time-bounded historical data.
+    using time-bounded historical data with Min-Max scaling [-1,1].
     """
 
     # -----------------------------
-    # Fetch historical data (time-based)
+    # Fetch historical data
     # -----------------------------
     client = DeltaDataClient()
-
-    df = client.get_candles(
-        symbol=symbol,
-        resolution=resolution,
-        start_date=start_date,
-        end_date=end_date
-    )
+    df = client.get_candles(symbol=symbol, resolution=resolution, start_date=start_date, end_date=end_date)
 
     # -----------------------------
     # Feature engineering
@@ -45,27 +39,10 @@ def train_lstm_model(
     df = feature_engineering(df)
 
     features = [
-        # Raw
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume",
-
-        # Price dynamics
-        "returns",
-        "candle_body",
-        "upper_wick",
-        "lower_wick",
-
-        # Regime
-        "volatility_5",
-
-        # Light indicators
-        "ema_20",
-        "ema_50",
-        "rsi",
-        "atr",
+        "open", "high", "low", "close",   # raw OHLC
+        "returns", "candle_body",         # price dynamics
+        "volatility_5",                   # regime
+        "ema_20", "rsi"                   # light indicators
     ]
 
     df = df.dropna().reset_index(drop=True)
@@ -90,9 +67,9 @@ def train_lstm_model(
     y_train, y_val, y_test = y[:train_end], y[train_end:val_end], y[val_end:]
 
     # -----------------------------
-    # Scale features (fit ONLY on train)
+    # Min-Max scale features to [-1, 1] (fit on train only)
     # -----------------------------
-    scaler = StandardScaler()
+    scaler = MinMaxScaler(feature_range=(-1, 1))
     X_train = scaler.fit_transform(X_train)
     X_val = scaler.transform(X_val)
     X_test = scaler.transform(X_test)
@@ -112,29 +89,20 @@ def train_lstm_model(
     # LSTM model
     # -----------------------------
     model = Sequential([
-        LSTM(
-            64,
-            input_shape=(sequence_length, X_train_seq.shape[2]),
-            return_sequences=False
-        ),
+        LSTM(64, input_shape=(sequence_length, X_train_seq.shape[2]), return_sequences=False),
         Dropout(0.3),
         Dense(32, activation="relu"),
         Dropout(0.2),
         Dense(2, activation="softmax")
     ])
 
-    model.compile(
-        optimizer="adam",
-        loss="categorical_crossentropy",
-        metrics=["accuracy"]
-    )
+    model.compile(optimizer="adam", loss="categorical_crossentropy", metrics=["accuracy"])
 
     # -----------------------------
     # Train
     # -----------------------------
     history = model.fit(
-        X_train_seq,
-        y_train_cat,
+        X_train_seq, y_train_cat,
         epochs=epochs,
         batch_size=batch_size,
         validation_data=(X_val_seq, y_val_cat),
