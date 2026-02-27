@@ -1,136 +1,45 @@
 import numpy as np
 import pandas as pd
 
+from sklearn.preprocessing import StandardScaler
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout, Input
 from tensorflow.keras.callbacks import EarlyStopping
 from tensorflow.keras.optimizers import Adam
 
-from sklearn.preprocessing import StandardScaler
-
 from data.delta_exchange import DeltaDataClient
-from data.feature_engineering import add_return_wick_vol_features
+from data.feature_engineering import feature_engineering_lstm
+from models.lstm.sequence_builder import make_windows
+from models.lstm.confidence_threshold import eval_with_ignore_zone
 
 
-def make_windows_next_candle_direction_with_features(
-    df: pd.DataFrame,
-    x_window_size: int = 100,
-    feature_cols=None,
-):
-    """
-    Builds raw (UNSCALED) windows + next-candle direction labels.
-
-    Scaling is intentionally NOT done here.
-    We'll do train-only StandardScaler after splitting.
-    """
-    if feature_cols is None:
-        feature_cols = [
-            "open", "high", "low", "close", "volume",
-            "log_ret_1", "body", "range", "upper_wick", "lower_wick", "clv",
-            "vol_10", "vol_30",
-        ]
-
-    data = df[feature_cols].astype(float).reset_index(drop=True)
-
-    X_list, y_list = [], []
-    for i in range(x_window_size, len(data)):
-        # Raw window (no min-max)
-        x_win = data.iloc[i - x_window_size:i].values  # (x_window_size, n_features)
-
-        prev_close = float(df.iloc[i - 1]["close"])
-        next_close = float(df.iloc[i]["close"])
-        y = 1 if next_close > prev_close else 0
-
-        X_list.append(x_win)
-        y_list.append(y)
-
-    X = np.asarray(X_list, dtype=np.float32)  # (N, x_window_size, F)
-    y = np.asarray(y_list, dtype=np.int32)    # (N,)
-    return X, y
-
-
-def standard_scale_train_only(X_train: np.ndarray, X_test: np.ndarray):
-    """
-    Fit StandardScaler on TRAIN ONLY, feature-wise across all timesteps.
-
-    We reshape (N, T, F) -> (N*T, F) to fit/transform.
-    """
-    n_features = X_train.shape[-1]
-    scaler = StandardScaler()
-
-    X_train_2d = X_train.reshape(-1, n_features)
-    scaler.fit(X_train_2d)
-
-    def transform(X):
-        X2d = X.reshape(-1, n_features)
-        X2d = scaler.transform(X2d)
-        return X2d.reshape(X.shape).astype(np.float32)
-
-    return transform(X_train), transform(X_test), scaler
-
-
-def eval_with_ignore_zone(y_true: np.ndarray, p: np.ndarray, threshold: float):
-    y_true = y_true.reshape(-1)
-    p = p.reshape(-1)
-
-    TP = FP = TN = FN = ignored = 0
-
-    for yt, prob in zip(y_true, p):
-        if prob >= threshold:
-            pred = 1
-        elif prob < 1.0 - threshold:
-            pred = 0
-        else:
-            ignored += 1
-            continue
-
-        if yt == 1 and pred == 1:
-            TP += 1
-        elif yt == 0 and pred == 1:
-            FP += 1
-        elif yt == 0 and pred == 0:
-            TN += 1
-        elif yt == 1 and pred == 0:
-            FN += 1
-
-    total = TP + FP + TN + FN
-    eps = 1e-8
-    acc = (TP + TN) / (total + eps)
-    prec = TP / (TP + FP + eps)
-    rec = TP / (TP + FN + eps)
-    f1 = 2 * prec * rec / (prec + rec + eps)
-    coverage = total / (total + ignored + eps)
-
-    return {
-        "threshold": threshold,
-        "coverage": float(coverage),
-        "ignored": int(ignored),
-        "used_samples": int(total),
-        "TP": int(TP), "FP": int(FP), "TN": int(TN), "FN": int(FN),
-        "accuracy": float(acc),
-        "precision": float(prec),
-        "recall": float(rec),
-        "f1": float(f1),
-    }
-
-
-def train_lstm_model_next_direction_stdscale(
+def train_lstm_model(
     symbol: str = "BTCUSD",
     resolution: str = "1h",
     start_date: str = "2019-06-01",
-    end_date: str = None,
+    end_date: str | None = None,
     x_window_size: int = 100,
     epochs: int = 10,
     batch_size: int = 64,
     model_path: str = "lstm_next_direction_stdscale.keras",
+    thresholds: tuple[float, ...] = (0.5, 0.55, 0.6),
 ):
     """
-    Same target + same model architecture as before,
-    BUT replaces per-window min-max with:
-      ✅ Train-only StandardScaler applied feature-wise across all timesteps.
+    Next-candle direction LSTM with:
+      - feature_engineering_lstm(df)
+      - RAW windows via make_windows(df, x_window_size, feature_cols)
+      - train-only StandardScaler (fit on train windows across all timesteps)
+      - LSTM(100) + Dropout(0.2) + Dense(sigmoid)
+      - chronological 95/5 split
+      - optional ignore-zone metrics at given thresholds
 
-    This preserves absolute scale/regime info better (often improves separability).
+    Returns:
+      model, history, out_df (y_true + prob), metrics_df, scaler
     """
+
+    # -----------------------------
+    # 1) Fetch candles
+    # -----------------------------
     client = DeltaDataClient()
     df = client.get_candles(
         symbol=symbol,
@@ -146,8 +55,10 @@ def train_lstm_model_next_direction_stdscale(
 
     df = df.dropna(subset=list(required)).reset_index(drop=True)
 
-    # Feature engineering (returns+wicks+vol)
-    df = add_return_wick_vol_features(df)
+    # -----------------------------
+    # 2) Feature engineering
+    # -----------------------------
+    df = feature_engineering_lstm(df)
 
     feature_cols = [
         "open", "high", "low", "close", "volume",
@@ -156,26 +67,48 @@ def train_lstm_model_next_direction_stdscale(
     ]
     df = df.dropna(subset=feature_cols).reset_index(drop=True)
 
-    # Build RAW windows + labels
-    X, y = make_windows_next_candle_direction_with_features(
-        df,
-        x_window_size=x_window_size,
-        feature_cols=feature_cols
-    )
+    # -----------------------------
+    # 3) Windowing + label
+    # -----------------------------
+    X, y = make_windows(df, x_window_size=x_window_size, feature_cols=feature_cols)
+    X = np.asarray(X, dtype=np.float32)
+    y = np.asarray(y, dtype=np.int32)
 
-    # 95/5 chrono split
+    if X.ndim != 3:
+        raise ValueError(f"Expected X with shape (N, T, F), got {X.shape}")
+    if X.shape[1] != x_window_size:
+        raise ValueError(f"Expected T={x_window_size}, got {X.shape[1]}")
+    if X.shape[2] != len(feature_cols):
+        raise ValueError(f"Expected F={len(feature_cols)}, got {X.shape[2]}")
+
+    # -----------------------------
+    # 4) Chronological split (95/5)
+    # -----------------------------
     n = len(X)
     train_end = int(n * 0.95)
+    if train_end <= 0 or train_end >= n:
+        raise ValueError(f"Not enough samples after windowing. n={n}")
 
     X_train, X_test = X[:train_end], X[train_end:]
     y_train, y_test = y[:train_end], y[train_end:]
 
-    # ✅ Train-only scaling
-    X_train_s, X_test_s, scaler = standard_scale_train_only(X_train, X_test)
+    # -----------------------------
+    # 5) Train-only StandardScaler
+    # -----------------------------
+    n_features = X_train.shape[-1]
+    scaler = StandardScaler()
 
-    # Model (architecture unchanged; use Input to remove Keras warning)
+    X_train_2d = X_train.reshape(-1, n_features)
+    scaler.fit(X_train_2d)
+
+    X_train_s = scaler.transform(X_train_2d).reshape(X_train.shape).astype(np.float32)
+    X_test_s = scaler.transform(X_test.reshape(-1, n_features)).reshape(X_test.shape).astype(np.float32)
+
+    # -----------------------------
+    # 6) Model
+    # -----------------------------
     model = Sequential([
-        Input(shape=(x_window_size, len(feature_cols))),
+        Input(shape=(x_window_size, n_features)),
         LSTM(100, return_sequences=False),
         Dropout(0.2),
         Dense(1, activation="sigmoid"),
@@ -199,27 +132,23 @@ def train_lstm_model_next_direction_stdscale(
 
     model.save(model_path)
 
-    # Test predictions + ignore-zone metrics
+    # -----------------------------
+    # 7) Test probs + metrics
+    # -----------------------------
     p_test = model.predict(X_test_s, batch_size=batch_size).reshape(-1)
 
-    metrics = []
-    for t in [0.5, 0.55, 0.6]:
-        m = eval_with_ignore_zone(y_test, p_test, threshold=t)
-        metrics.append(m)
-        print(m)
+    out_df = pd.DataFrame({"y_true": y_test.astype(int), "p": p_test.astype(float)})
+    out_df.to_csv("lstm_next_direction_stdscale_test_probs.csv", index=False)
 
-    out = pd.DataFrame({"y_true": y_test, "p": p_test})
-    out.to_csv("lstm_next_direction_stdscale_test_probs.csv", index=False)
-
+    metrics = [eval_with_ignore_zone(y_test, p_test, threshold=t) for t in thresholds]
     metrics_df = pd.DataFrame(metrics)
     metrics_df.to_csv("lstm_next_direction_stdscale_metrics.csv", index=False)
 
     print("✅ Saved:", model_path)
     print("✅ Saved: lstm_next_direction_stdscale_test_probs.csv")
     print("✅ Saved: lstm_next_direction_stdscale_metrics.csv")
-
     print("\n📊 Label balance:")
-    print(f"Train UP rate: {y_train.mean():.4f}")
-    print(f"Test  UP rate: {y_test.mean():.4f}")
+    print(f"Train UP rate: {float(y_train.mean()):.4f}")
+    print(f"Test  UP rate: {float(y_test.mean()):.4f}")
 
-    return model, history, out, metrics_df, scaler
+    return model, history, out_df, metrics_df, scaler

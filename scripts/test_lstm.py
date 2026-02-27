@@ -9,7 +9,7 @@ from sklearn.metrics import (
 )
 
 # ✅ UPDATED: import the StandardScaler-based trainer (train-only scaling)
-from models.lstm.lstm import train_lstm_model_next_direction_stdscale
+from models.lstm.lstm import train_lstm_model
 
 
 # -----------------------------
@@ -144,7 +144,7 @@ def main():
 
     # ✅ UPDATED: call the StandardScaler-based trainer
     # NOTE: this returns (model, history, out_df, metrics_df, scaler)
-    model, history, probs_df, metrics_df, scaler = train_lstm_model_next_direction_stdscale(
+    model, history, probs_df, metrics_df, scaler = train_lstm_model(
         symbol="BTCUSD",
         resolution="1h",
         start_date="2019-06-01",

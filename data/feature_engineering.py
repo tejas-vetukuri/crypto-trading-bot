@@ -59,7 +59,7 @@ def feature_engineering(df, horizon=6):
     return df
 
 
-def add_return_wick_vol_features(df: pd.DataFrame) -> pd.DataFrame:
+def feature_engineering_lstm(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
     for c in ["open", "high", "low", "close", "volume"]:
