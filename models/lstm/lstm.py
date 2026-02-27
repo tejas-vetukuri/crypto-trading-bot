@@ -2,59 +2,14 @@ import numpy as np
 import pandas as pd
 
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout
+from tensorflow.keras.layers import LSTM, Dense, Dropout, Input
 from tensorflow.keras.callbacks import EarlyStopping
 from tensorflow.keras.optimizers import Adam
 
+from sklearn.preprocessing import StandardScaler
+
 from data.delta_exchange import DeltaDataClient
-
-
-def add_return_wick_vol_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Adds:
-      - log return (1-step)
-      - candle body/range + wicks (scale-free)
-      - rolling volatility of log returns
-
-    Uses ONLY current/past info (no leakage), but will create NaNs at the start.
-    """
-    df = df.copy()
-
-    # Ensure float
-    for c in ["open", "high", "low", "close", "volume"]:
-        df[c] = df[c].astype(float)
-
-    eps = 1e-12
-
-    # 1) Returns
-    df["log_ret_1"] = np.log((df["close"] + eps) / (df["close"].shift(1) + eps))
-
-    # 2) Candle geometry (all normalized by open to be scale-free)
-    o = df["open"]
-    h = df["high"]
-    l = df["low"]
-    c = df["close"]
-
-    df["body"] = (c - o) / (o + eps)
-    df["range"] = (h - l) / (o + eps)
-
-    max_oc = np.maximum(o, c)
-    min_oc = np.minimum(o, c)
-
-    df["upper_wick"] = (h - max_oc) / (o + eps)
-    df["lower_wick"] = (min_oc - l) / (o + eps)
-
-    # Close location value (optional but very useful for wicks/range context)
-    df["clv"] = (2.0 * c - h - l) / ((h - l) + eps)  # in [-1, 1] (roughly)
-
-    # 3) Volatility (rolling std of returns)
-    df["vol_10"] = df["log_ret_1"].rolling(10).std()
-    df["vol_30"] = df["log_ret_1"].rolling(30).std()
-
-    # Replace inf and keep NaNs (we'll drop them later)
-    df = df.replace([np.inf, -np.inf], np.nan)
-
-    return df
+from data.feature_engineering import add_return_wick_vol_features
 
 
 def make_windows_next_candle_direction_with_features(
@@ -63,12 +18,10 @@ def make_windows_next_candle_direction_with_features(
     feature_cols=None,
 ):
     """
-    Same as before:
-      - X window: last x_window_size candles (ending at i-1)
-      - y label: 1 if close[i] > close[i-1] else 0
-      - per-window min-max normalization (feature-wise)
+    Builds raw (UNSCALED) windows + next-candle direction labels.
 
-    BUT now you can pass expanded feature_cols (returns+wicks+volatility).
+    Scaling is intentionally NOT done here.
+    We'll do train-only StandardScaler after splitting.
     """
     if feature_cols is None:
         feature_cols = [
@@ -80,27 +33,40 @@ def make_windows_next_candle_direction_with_features(
     data = df[feature_cols].astype(float).reset_index(drop=True)
 
     X_list, y_list = [], []
-
-    # i is the "next candle" index whose movement we predict
     for i in range(x_window_size, len(data)):
-        x_win = data.iloc[i - x_window_size:i].copy()
+        # Raw window (no min-max)
+        x_win = data.iloc[i - x_window_size:i].values  # (x_window_size, n_features)
 
         prev_close = float(df.iloc[i - 1]["close"])
         next_close = float(df.iloc[i]["close"])
         y = 1 if next_close > prev_close else 0
 
-        # per-window min-max normalization (feature-wise)
-        x_min = x_win.min(axis=0)
-        x_max = x_win.max(axis=0)
-        denom = (x_max - x_min).replace(0, 1.0)
-        x_norm = (x_win - x_min) / denom
-
-        X_list.append(x_norm.values)
+        X_list.append(x_win)
         y_list.append(y)
 
-    X = np.asarray(X_list, dtype=np.float32)
-    y = np.asarray(y_list, dtype=np.int32)
+    X = np.asarray(X_list, dtype=np.float32)  # (N, x_window_size, F)
+    y = np.asarray(y_list, dtype=np.int32)    # (N,)
     return X, y
+
+
+def standard_scale_train_only(X_train: np.ndarray, X_test: np.ndarray):
+    """
+    Fit StandardScaler on TRAIN ONLY, feature-wise across all timesteps.
+
+    We reshape (N, T, F) -> (N*T, F) to fit/transform.
+    """
+    n_features = X_train.shape[-1]
+    scaler = StandardScaler()
+
+    X_train_2d = X_train.reshape(-1, n_features)
+    scaler.fit(X_train_2d)
+
+    def transform(X):
+        X2d = X.reshape(-1, n_features)
+        X2d = scaler.transform(X2d)
+        return X2d.reshape(X.shape).astype(np.float32)
+
+    return transform(X_train), transform(X_test), scaler
 
 
 def eval_with_ignore_zone(y_true: np.ndarray, p: np.ndarray, threshold: float):
@@ -148,7 +114,7 @@ def eval_with_ignore_zone(y_true: np.ndarray, p: np.ndarray, threshold: float):
     }
 
 
-def train_lstm_model_next_direction_gyusu_norm(
+def train_lstm_model_next_direction_stdscale(
     symbol: str = "BTCUSD",
     resolution: str = "1h",
     start_date: str = "2019-06-01",
@@ -156,19 +122,15 @@ def train_lstm_model_next_direction_gyusu_norm(
     x_window_size: int = 100,
     epochs: int = 10,
     batch_size: int = 64,
-    model_path: str = "lstm_next_direction_gyusu_norm.h5",
+    model_path: str = "lstm_next_direction_stdscale.keras",
 ):
     """
-    Same model + same per-window min-max normalization + same 95/5 split,
-    but adds:
-      - returns
-      - wick/body/range
-      - rolling volatility
+    Same target + same model architecture as before,
+    BUT replaces per-window min-max with:
+      ✅ Train-only StandardScaler applied feature-wise across all timesteps.
 
-    Target remains next-candle direction.
+    This preserves absolute scale/regime info better (often improves separability).
     """
-
-    # Fetch data
     client = DeltaDataClient()
     df = client.get_candles(
         symbol=symbol,
@@ -184,10 +146,9 @@ def train_lstm_model_next_direction_gyusu_norm(
 
     df = df.dropna(subset=list(required)).reset_index(drop=True)
 
-    # ✅ Add engineered features
+    # Feature engineering (returns+wicks+vol)
     df = add_return_wick_vol_features(df)
 
-    # Drop rows where features not available (rolling/std/shift)
     feature_cols = [
         "open", "high", "low", "close", "volume",
         "log_ret_1", "body", "range", "upper_wick", "lower_wick", "clv",
@@ -195,28 +156,27 @@ def train_lstm_model_next_direction_gyusu_norm(
     ]
     df = df.dropna(subset=feature_cols).reset_index(drop=True)
 
-    # Windowing + labels
+    # Build RAW windows + labels
     X, y = make_windows_next_candle_direction_with_features(
         df,
         x_window_size=x_window_size,
         feature_cols=feature_cols
     )
 
-    # 95/5 split
+    # 95/5 chrono split
     n = len(X)
     train_end = int(n * 0.95)
 
     X_train, X_test = X[:train_end], X[train_end:]
     y_train, y_test = y[:train_end], y[train_end:]
 
-    # Class weights
-    pos = float(y_train.sum())
-    neg = float(len(y_train) - pos)
-    class_weight = {0: 1.0, 1: (neg / (pos + 1e-8))}
+    # ✅ Train-only scaling
+    X_train_s, X_test_s, scaler = standard_scale_train_only(X_train, X_test)
 
-    # Model (unchanged except input dim now = len(feature_cols))
+    # Model (architecture unchanged; use Input to remove Keras warning)
     model = Sequential([
-        LSTM(100, input_shape=(x_window_size, len(feature_cols)), return_sequences=False),
+        Input(shape=(x_window_size, len(feature_cols))),
+        LSTM(100, return_sequences=False),
         Dropout(0.2),
         Dense(1, activation="sigmoid"),
     ])
@@ -228,11 +188,10 @@ def train_lstm_model_next_direction_gyusu_norm(
     )
 
     history = model.fit(
-        X_train, y_train,
+        X_train_s, y_train,
         epochs=epochs,
         batch_size=batch_size,
         validation_split=0.05,
-        class_weight=class_weight,
         shuffle=False,
         callbacks=[EarlyStopping(patience=3, restore_best_weights=True)],
         verbose=1
@@ -241,7 +200,7 @@ def train_lstm_model_next_direction_gyusu_norm(
     model.save(model_path)
 
     # Test predictions + ignore-zone metrics
-    p_test = model.predict(X_test, batch_size=batch_size).reshape(-1)
+    p_test = model.predict(X_test_s, batch_size=batch_size).reshape(-1)
 
     metrics = []
     for t in [0.5, 0.55, 0.6]:
@@ -250,18 +209,17 @@ def train_lstm_model_next_direction_gyusu_norm(
         print(m)
 
     out = pd.DataFrame({"y_true": y_test, "p": p_test})
-    out.to_csv("lstm_next_direction_gyusu_norm_test_probs.csv", index=False)
+    out.to_csv("lstm_next_direction_stdscale_test_probs.csv", index=False)
 
     metrics_df = pd.DataFrame(metrics)
-    metrics_df.to_csv("lstm_next_direction_gyusu_norm_metrics.csv", index=False)
+    metrics_df.to_csv("lstm_next_direction_stdscale_metrics.csv", index=False)
 
     print("✅ Saved:", model_path)
-    print("✅ Saved: lstm_next_direction_gyusu_norm_test_probs.csv")
-    print("✅ Saved: lstm_next_direction_gyusu_norm_metrics.csv")
+    print("✅ Saved: lstm_next_direction_stdscale_test_probs.csv")
+    print("✅ Saved: lstm_next_direction_stdscale_metrics.csv")
 
-    # Sanity: label balance
     print("\n📊 Label balance:")
     print(f"Train UP rate: {y_train.mean():.4f}")
     print(f"Test  UP rate: {y_test.mean():.4f}")
 
-    return model, history, out, metrics_df
+    return model, history, out, metrics_df, scaler
