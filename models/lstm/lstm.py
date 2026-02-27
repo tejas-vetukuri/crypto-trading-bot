@@ -9,31 +9,84 @@ from tensorflow.keras.optimizers import Adam
 from data.delta_exchange import DeltaDataClient
 
 
-def make_windows_next_candle_direction(
+def add_return_wick_vol_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Adds:
+      - log return (1-step)
+      - candle body/range + wicks (scale-free)
+      - rolling volatility of log returns
+
+    Uses ONLY current/past info (no leakage), but will create NaNs at the start.
+    """
+    df = df.copy()
+
+    # Ensure float
+    for c in ["open", "high", "low", "close", "volume"]:
+        df[c] = df[c].astype(float)
+
+    eps = 1e-12
+
+    # 1) Returns
+    df["log_ret_1"] = np.log((df["close"] + eps) / (df["close"].shift(1) + eps))
+
+    # 2) Candle geometry (all normalized by open to be scale-free)
+    o = df["open"]
+    h = df["high"]
+    l = df["low"]
+    c = df["close"]
+
+    df["body"] = (c - o) / (o + eps)
+    df["range"] = (h - l) / (o + eps)
+
+    max_oc = np.maximum(o, c)
+    min_oc = np.minimum(o, c)
+
+    df["upper_wick"] = (h - max_oc) / (o + eps)
+    df["lower_wick"] = (min_oc - l) / (o + eps)
+
+    # Close location value (optional but very useful for wicks/range context)
+    df["clv"] = (2.0 * c - h - l) / ((h - l) + eps)  # in [-1, 1] (roughly)
+
+    # 3) Volatility (rolling std of returns)
+    df["vol_10"] = df["log_ret_1"].rolling(10).std()
+    df["vol_30"] = df["log_ret_1"].rolling(30).std()
+
+    # Replace inf and keep NaNs (we'll drop them later)
+    df = df.replace([np.inf, -np.inf], np.nan)
+
+    return df
+
+
+def make_windows_next_candle_direction_with_features(
     df: pd.DataFrame,
     x_window_size: int = 100,
+    feature_cols=None,
 ):
     """
-    Same windowing + per-window min-max normalization as gyusu-style,
-    BUT target is next-candle direction:
-
+    Same as before:
       - X window: last x_window_size candles (ending at i-1)
-      - y label: 1 if close[i] > close[i-1] else 0   (next candle direction)
-      - normalization: min-max per X window (feature-wise)
+      - y label: 1 if close[i] > close[i-1] else 0
+      - per-window min-max normalization (feature-wise)
+
+    BUT now you can pass expanded feature_cols (returns+wicks+volatility).
     """
-    cols = ["open", "high", "low", "close", "volume"]
-    data = df[cols].astype(float).reset_index(drop=True)
+    if feature_cols is None:
+        feature_cols = [
+            "open", "high", "low", "close", "volume",
+            "log_ret_1", "body", "range", "upper_wick", "lower_wick", "clv",
+            "vol_10", "vol_30",
+        ]
+
+    data = df[feature_cols].astype(float).reset_index(drop=True)
 
     X_list, y_list = [], []
 
-    # i is the "next candle" index whose movement we want to predict
-    # X uses candles [i-x_window_size, ..., i-1]
-    # y compares close[i] vs close[i-1]
+    # i is the "next candle" index whose movement we predict
     for i in range(x_window_size, len(data)):
         x_win = data.iloc[i - x_window_size:i].copy()
 
-        prev_close = float(data.iloc[i - 1]["close"])
-        next_close = float(data.iloc[i]["close"])
+        prev_close = float(df.iloc[i - 1]["close"])
+        next_close = float(df.iloc[i]["close"])
         y = 1 if next_close > prev_close else 0
 
         # per-window min-max normalization (feature-wise)
@@ -45,20 +98,12 @@ def make_windows_next_candle_direction(
         X_list.append(x_norm.values)
         y_list.append(y)
 
-    X = np.asarray(X_list, dtype=np.float32)   # (N, x_window_size, 5)
-    y = np.asarray(y_list, dtype=np.int32)     # (N,)
+    X = np.asarray(X_list, dtype=np.float32)
+    y = np.asarray(y_list, dtype=np.int32)
     return X, y
 
 
 def eval_with_ignore_zone(y_true: np.ndarray, p: np.ndarray, threshold: float):
-    """
-    Confidence gating:
-      predict 1 if p >= threshold
-      predict 0 if p < 1 - threshold
-      else ignored
-
-    Returns accuracy/precision/recall/f1 computed ONLY on non-ignored samples.
-    """
     y_true = y_true.reshape(-1)
     p = p.reshape(-1)
 
@@ -88,7 +133,6 @@ def eval_with_ignore_zone(y_true: np.ndarray, p: np.ndarray, threshold: float):
     prec = TP / (TP + FP + eps)
     rec = TP / (TP + FN + eps)
     f1 = 2 * prec * rec / (prec + rec + eps)
-
     coverage = total / (total + ignored + eps)
 
     return {
@@ -106,8 +150,8 @@ def eval_with_ignore_zone(y_true: np.ndarray, p: np.ndarray, threshold: float):
 
 def train_lstm_model_next_direction_gyusu_norm(
     symbol: str = "BTCUSD",
-    resolution: str = "1m",
-    start_date: str = "2024-01-01",
+    resolution: str = "1h",
+    start_date: str = "2019-06-01",
     end_date: str = None,
     x_window_size: int = 100,
     epochs: int = 10,
@@ -115,20 +159,16 @@ def train_lstm_model_next_direction_gyusu_norm(
     model_path: str = "lstm_next_direction_gyusu_norm.h5",
 ):
     """
-    Keeps the rest of the gyusu-style pipeline the same:
-    - Uses ONLY OHLCV
-    - Per-window min-max normalization (feature-wise)
-    - Same model: LSTM(100) + Dropout(0.2) + Dense(1,sigmoid)
-    - Same class-weighted BCE logic
-    - Same ignore-zone metrics at thresholds [0.5, 0.55, 0.6]
+    Same model + same per-window min-max normalization + same 95/5 split,
+    but adds:
+      - returns
+      - wick/body/range
+      - rolling volatility
 
-    ONLY change:
-    - Target is next-candle direction (close[i] > close[i-1])
+    Target remains next-candle direction.
     """
 
-    # -----------------------------
-    # Fetch historical data
-    # -----------------------------
+    # Fetch data
     client = DeltaDataClient()
     df = client.get_candles(
         symbol=symbol,
@@ -137,43 +177,46 @@ def train_lstm_model_next_direction_gyusu_norm(
         end_date=end_date
     )
 
-    # Ensure required columns exist
     required = {"open", "high", "low", "close", "volume"}
     missing = required - set(df.columns)
     if missing:
         raise ValueError(f"Missing required columns: {missing}")
 
-    df = df.dropna(subset=["open", "high", "low", "close", "volume"]).reset_index(drop=True)
+    df = df.dropna(subset=list(required)).reset_index(drop=True)
 
-    # -----------------------------
-    # Windowing + labels (UPDATED TARGET)
-    # -----------------------------
-    X, y = make_windows_next_candle_direction(
+    # ✅ Add engineered features
+    df = add_return_wick_vol_features(df)
+
+    # Drop rows where features not available (rolling/std/shift)
+    feature_cols = [
+        "open", "high", "low", "close", "volume",
+        "log_ret_1", "body", "range", "upper_wick", "lower_wick", "clv",
+        "vol_10", "vol_30",
+    ]
+    df = df.dropna(subset=feature_cols).reset_index(drop=True)
+
+    # Windowing + labels
+    X, y = make_windows_next_candle_direction_with_features(
         df,
         x_window_size=x_window_size,
+        feature_cols=feature_cols
     )
 
-    # -----------------------------
-    # Chronological split (95/5 like their config)
-    # -----------------------------
+    # 95/5 split
     n = len(X)
     train_end = int(n * 0.95)
 
     X_train, X_test = X[:train_end], X[train_end:]
     y_train, y_test = y[:train_end], y[train_end:]
 
-    # -----------------------------
-    # Class weights (imbalance handling)
-    # -----------------------------
+    # Class weights
     pos = float(y_train.sum())
     neg = float(len(y_train) - pos)
     class_weight = {0: 1.0, 1: (neg / (pos + 1e-8))}
 
-    # -----------------------------
-    # Model: SAME as before
-    # -----------------------------
+    # Model (unchanged except input dim now = len(feature_cols))
     model = Sequential([
-        LSTM(100, input_shape=(x_window_size, 5), return_sequences=False),
+        LSTM(100, input_shape=(x_window_size, len(feature_cols)), return_sequences=False),
         Dropout(0.2),
         Dense(1, activation="sigmoid"),
     ])
@@ -197,9 +240,7 @@ def train_lstm_model_next_direction_gyusu_norm(
 
     model.save(model_path)
 
-    # -----------------------------
     # Test predictions + ignore-zone metrics
-    # -----------------------------
     p_test = model.predict(X_test, batch_size=batch_size).reshape(-1)
 
     metrics = []
@@ -218,7 +259,7 @@ def train_lstm_model_next_direction_gyusu_norm(
     print("✅ Saved: lstm_next_direction_gyusu_norm_test_probs.csv")
     print("✅ Saved: lstm_next_direction_gyusu_norm_metrics.csv")
 
-    # Quick sanity check: class balance
+    # Sanity: label balance
     print("\n📊 Label balance:")
     print(f"Train UP rate: {y_train.mean():.4f}")
     print(f"Test  UP rate: {y_test.mean():.4f}")
