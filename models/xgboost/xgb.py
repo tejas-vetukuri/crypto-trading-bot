@@ -7,7 +7,7 @@ from xgboost import XGBClassifier
 from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import classification_report, confusion_matrix
 
-from joblib import dump
+from joblib import dump, load
 
 from data.delta_exchange import DeltaDataClient
 from data.feature_engineering import feature_engineering_xgb
@@ -20,26 +20,26 @@ def train_xgb_model(
     end_date: str | None = None,
     train_ratio: float = 0.80,
 
-    # NEW: shift the UP/DOWN decision boundary away from 0.5
-    # predict UP if p_up > decision_boundary else DOWN (when not sideways)
+    # Decision boundary (shift from 0.5 to fix skew)
     decision_boundary: float = 0.46,
 
-    # OPTIONAL: keep ignore zone, but now centered around decision_boundary
-    # keep only if |p_up - decision_boundary| >= margin_threshold
-    margin_threshold: float = 0.05,
+    # Ignore zone around boundary
+    margin_threshold: float = 0.07,
+
+    # Path to the tuned artifacts that contains best_params
+    tuned_artifacts_path: str = "xgb_tuned_artifacts.joblib",
 
     artifacts_path: str = "xgb_trend_artifacts.joblib",
     preds_csv_path: str = "xgb_predictions.csv",
 ):
     """
     XGBoost next-direction classifier with:
-
       - DeltaDataClient fetch
       - Feature engineering
       - Chronological split
-      - Train-only LabelEncoder
-      - Decision boundary shift (default 0.50)
-      - Optional margin-based ignore zone around the boundary
+      - Binary labels: down=0, up=1 (stable)
+      - Decision boundary shift + optional ignore zone
+      - Loads tuned hyperparameters from tuned_artifacts_path (best_params)
       - Artifact saving
 
     Returns:
@@ -93,21 +93,37 @@ def train_xgb_model(
     y_test = test_df["actual_trend"].astype(str)
 
     # -----------------------------
-    # 4) Encode labels (train only)
+    # 4) Encode labels (stable binary)
     # -----------------------------
-    le = LabelEncoder()
-    y_train_enc = le.fit_transform(y_train)
-    y_test_enc = le.transform(y_test)
+    # Stable mapping for XGB: up=1, down=0
+    y_train_bin = (y_train.values == "up").astype(int)
+    y_test_bin = (y_test.values == "up").astype(int)
 
+    # Keep LabelEncoder just for artifacts / compatibility
+    le = LabelEncoder()
+    le.fit(y_train)
     if "up" not in le.classes_ or "down" not in le.classes_:
         raise ValueError(f"Expected classes to include 'up' and 'down', got {list(le.classes_)}")
 
-    up_class_idx = int(np.where(le.classes_ == "up")[0][0])
+    # -----------------------------
+    # 5) Load tuned hyperparameters (best_params)
+    # -----------------------------
+    best_params = None
+    try:
+        tuned_artifacts = load(tuned_artifacts_path)
+        if isinstance(tuned_artifacts, dict) and "best_params" in tuned_artifacts:
+            best_params = tuned_artifacts["best_params"]
+            print(f"✅ Loaded tuned best_params from {tuned_artifacts_path}")
+        else:
+            print(f"⚠️ No 'best_params' found in {tuned_artifacts_path}. Using defaults.")
+    except Exception as e:
+        print(f"⚠️ Could not load tuned artifacts from {tuned_artifacts_path}: {e}")
+        print("⚠️ Using default XGB params.")
 
     # -----------------------------
-    # 5) Train model (binary)
+    # 6) Train model (binary)
     # -----------------------------
-    model = XGBClassifier(
+    default_params = dict(
         objective="binary:logistic",
         eval_metric="logloss",
         n_estimators=300,
@@ -116,12 +132,24 @@ def train_xgb_model(
         subsample=0.8,
         colsample_bytree=0.8,
         random_state=42,
+        tree_method="hist",
     )
 
-    model.fit(X_train, y_train_enc)
+    # Merge tuned params over defaults (tuned wins)
+    if isinstance(best_params, dict):
+        model_params = {**default_params, **best_params}
+    else:
+        model_params = default_params
+
+    # Safety: force the essentials we rely on
+    model_params["objective"] = "binary:logistic"
+    model_params["eval_metric"] = "logloss"
+
+    model = XGBClassifier(**model_params)
+    model.fit(X_train, y_train_bin)
 
     # -----------------------------
-    # 6) Predict + Decision Boundary (+ optional ignore zone)
+    # 7) Predict + Decision Boundary (+ optional ignore zone)
     # -----------------------------
     if not (0.0 < decision_boundary < 1.0):
         raise ValueError(f"decision_boundary must be in (0, 1). Got {decision_boundary}")
@@ -130,23 +158,18 @@ def train_xgb_model(
         raise ValueError(f"margin_threshold must be >= 0. Got {margin_threshold}")
 
     probs = model.predict_proba(X_test)  # shape (N, 2)
-    p_up = probs[:, up_class_idx]        # P(up)
+    p_up = probs[:, 1]                   # because we trained with y_train_bin where up=1
 
-    # confidence distance from boundary
     margin = np.abs(p_up - decision_boundary)
 
-    # default: sideways (2)
-    final_preds = np.full(len(p_up), 2, dtype=int)
-
+    final_preds = np.full(len(p_up), 2, dtype=int)  # sideways default
     confident = margin >= margin_threshold
-
-    # If confident: predict up if p_up > decision_boundary else down
-    final_preds[confident] = (p_up[confident] > decision_boundary).astype(int)
+    final_preds[confident] = (p_up[confident] > decision_boundary).astype(int)  # 1=up, 0=down
 
     probability_for_pred = np.where(final_preds == 2, decision_boundary, p_up)
 
     # -----------------------------
-    # 7) Save predictions
+    # 8) Save predictions
     # -----------------------------
     output_df = pd.DataFrame({
         "timestamp": test_df["timestamp"].values,
@@ -163,34 +186,15 @@ def train_xgb_model(
     print(f"✅ Predictions saved to {preds_csv_path}")
 
     # -----------------------------
-    # 8) Save artifacts
-    # -----------------------------
-    artifacts = {
-        "model": model,
-        "label_encoder": le,
-        "features": features,
-        "decision_boundary": float(decision_boundary),
-        "margin_threshold": float(margin_threshold),
-        "symbol": symbol,
-        "resolution": resolution,
-        "start_date": start_date,
-        "end_date": end_date,
-        "ignore_zone": f"sideways if |p_up-{decision_boundary}| < {margin_threshold}",
-    }
-
-    dump(artifacts, artifacts_path)
-    print(f"✅ Model saved to {artifacts_path}")
-
-    # -----------------------------
-    # 9) Up/Down-only evaluation
+    # 9) Up/Down-only evaluation (USED trades)
     # -----------------------------
     mask = final_preds != 2
-    filtered_preds = final_preds[mask]
-    filtered_true = y_test_enc[mask]
+    filtered_preds = final_preds[mask]   # 0/1
+    filtered_true = y_test_bin[mask]     # 0/1
 
     if len(filtered_preds) > 0:
         print("\n📊 Classification Report (Up & Down only):")
-        print(classification_report(filtered_true, filtered_preds, target_names=le.classes_))
+        print(classification_report(filtered_true, filtered_preds, target_names=["down", "up"]))
 
         print("\n🔢 Confusion Matrix:")
         print(confusion_matrix(filtered_true, filtered_preds))
@@ -204,13 +208,36 @@ def train_xgb_model(
     print(f"➡️ Margin threshold: {margin_threshold}")
 
     print("\n📊 Label balance:")
-    train_up_rate = float((y_train.values == "up").mean())
-    test_up_rate = float((y_test.values == "up").mean())
-    print(f"Train UP rate: {train_up_rate:.4f}")
-    print(f"Test  UP rate: {test_up_rate:.4f}")
+    print(f"Train UP rate: {float(y_train_bin.mean()):.4f}")
+    print(f"Test  UP rate: {float(y_test_bin.mean()):.4f}")
+
+    # -----------------------------
+    # 10) Save artifacts (includes best_params used)
+    # -----------------------------
+    artifacts = {
+        "model": model,
+        "label_encoder": le,
+        "features": features,
+        "decision_boundary": float(decision_boundary),
+        "margin_threshold": float(margin_threshold),
+        "symbol": symbol,
+        "resolution": resolution,
+        "start_date": start_date,
+        "end_date": end_date,
+        "ignore_zone": f"sideways if |p_up-{decision_boundary}| < {margin_threshold}",
+        "best_params_used": model_params,
+        "tuned_artifacts_path": tuned_artifacts_path,
+    }
+
+    dump(artifacts, artifacts_path)
+    print(f"✅ Model saved to {artifacts_path}")
 
     return model, artifacts, output_df
 
 
 if __name__ == "__main__":
+    a = load("xgb_tuned_artifacts.joblib")
+    print(a.keys())
+    print(a["best_params"])
+
     train_xgb_model()
