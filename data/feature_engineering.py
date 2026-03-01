@@ -2,59 +2,39 @@ import numpy as np
 import pandas as pd
 from data.technical_indicators import TechnicalIndicators
 
-def feature_engineering(df, horizon=6):
+def feature_engineering_xgb(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Feature engineering for LSTM + forward-looking target
-
-    Args:
-        df (pd.DataFrame): OHLCV dataframe
-        horizon (int): Number of candles ahead to predict
-
-    Returns:
-        pd.DataFrame: dataframe with technical features, price dynamics, and future target
+    Feature engineering for XGBoost trend classifier.
+    Uses ONLY past information.
+    Label = next-candle direction.
     """
+    required = {"timestamp", "open", "high", "low", "close", "volume"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}")
 
-    # ==============================
-    # Technical Indicators
-    # ==============================
+    df = df.copy()
+    df = df.sort_values("timestamp").reset_index(drop=True)
+
+    # Indicators (must be causal implementations)
     df["ema_20"] = TechnicalIndicators.calculate_ema(df, 20)
     df["ema_50"] = TechnicalIndicators.calculate_ema(df, 50)
     df["rsi"] = TechnicalIndicators.calculate_rsi(df)
     df["atr"] = TechnicalIndicators.calculate_atr(df)
 
+    # Additional causal features
     df["momentum_3"] = df["close"] - df["close"].shift(3)
     df["volatility_5"] = df["close"].rolling(5).std()
 
-    # ==============================
-    # Price Dynamics
-    # ==============================
+    # Next-candle label (NO leakage)
+    df["actual_trend"] = np.where(
+        df["close"].shift(-1) > df["close"],
+        "up",
+        "down"
+    )
 
-    # Log returns
-    df["returns"] = np.log(df["close"] / df["close"].shift(1))
-
-    # Candle structure
-    df["candle_body"] = df["close"] - df["open"]
-    df["upper_wick"] = df["high"] - np.maximum(df["open"], df["close"])
-    df["lower_wick"] = np.minimum(df["open"], df["close"]) - df["low"]
-
-    # Total range
-    df["range"] = df["high"] - df["low"]
-
-    # Body strength relative to range (avoid division by zero)
-    df["body_ratio"] = df["candle_body"] / (df["range"] + 1e-9)
-
-    # ==============================
-    # Forward-Looking Target (NEW)
-    # ==============================
-
-    # Calculate future return over 'horizon' candles
-    df["future_return"] = (df["close"].shift(-horizon) - df["close"]) / df["close"]
-
-    # Convert to categorical target: 1 = price up, 0 = price down
-    df["future_trend"] = np.where(df["future_return"] > 0, 1, 0)
-
-    # Drop NaNs caused by rolling/shifting
-    df.dropna(inplace=True)
+    feature_cols = ["ema_20", "ema_50", "rsi", "momentum_3", "volatility_5"]
+    df = df.dropna(subset=feature_cols + ["actual_trend"]).reset_index(drop=True)
 
     return df
 
