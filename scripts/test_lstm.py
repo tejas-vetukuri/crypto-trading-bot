@@ -152,7 +152,11 @@ def main():
         x_window_size=100,
         epochs=10,
         batch_size=64,
-        model_path="lstm_next_direction_stdscale.keras",
+
+        # ✅ minimal change: save into models/lstm/
+        model_path="models/lstm/lstm.keras",
+        scaler_path="models/lstm/lstm_scaler.joblib",
+        artifacts_path="models/lstm/lstm_artifacts.joblib",
     )
 
     print("\n================ TRAINING SUMMARY ================")
@@ -167,7 +171,7 @@ def main():
     evaluate_auc(y_true, probs)
 
     print("\n📊 ================= THRESHOLDS + BASELINES =================")
-    for t in [0.5, 0.51, 0.52, 0.53, 0.54]:
+    for t in [0.5, 0.51, 0.52, 0.53, 0.54, 0.55, 0.56, 0.57, 0.58]:
         print("\n" + "=" * 55)
 
         coverage = evaluate_threshold(y_true, probs, threshold=t)

@@ -1,11 +1,16 @@
+# models/lstm/lstm.py
+
 import numpy as np
 import pandas as pd
+from pathlib import Path  # ✅ NEW
 
 from sklearn.preprocessing import StandardScaler
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout, Input
 from tensorflow.keras.callbacks import EarlyStopping
 from tensorflow.keras.optimizers import Adam
+
+from joblib import dump  # ✅
 
 from data.delta_exchange import DeltaDataClient
 from data.feature_engineering import feature_engineering_lstm
@@ -21,7 +26,12 @@ def train_lstm_model(
     x_window_size: int = 100,
     epochs: int = 10,
     batch_size: int = 64,
-    model_path: str = "lstm_next_direction_stdscale.keras",
+
+    # ✅ defaults match your folder structure
+    model_path: str = "models/lstm/lstm_next_direction_stdscale.keras",
+    scaler_path: str = "models/lstm/lstm_scaler.joblib",
+    artifacts_path: str = "models/lstm/lstm_artifacts.joblib",
+
     thresholds: tuple[float, ...] = (0.5, 0.55, 0.6),
 ):
     """
@@ -32,6 +42,11 @@ def train_lstm_model(
       - LSTM(100) + Dropout(0.2) + Dense(sigmoid)
       - chronological 95/5 split
       - optional ignore-zone metrics at given thresholds
+
+    Saves:
+      - model_path (.keras)
+      - scaler_path (.joblib)
+      - artifacts_path (.joblib) for RL auto-detect
 
     Returns:
       model, history, out_df (y_true + prob), metrics_df, scaler
@@ -101,6 +116,12 @@ def train_lstm_model(
     X_train_2d = X_train.reshape(-1, n_features)
     scaler.fit(X_train_2d)
 
+    # ✅ ensure directory exists before saving
+    scaler_path_p = Path(scaler_path)
+    scaler_path_p.parent.mkdir(parents=True, exist_ok=True)
+    dump(scaler, str(scaler_path_p))
+    print(f"✅ Saved: {scaler_path_p}")
+
     X_train_s = scaler.transform(X_train_2d).reshape(X_train.shape).astype(np.float32)
     X_test_s = scaler.transform(X_test.reshape(-1, n_features)).reshape(X_test.shape).astype(np.float32)
 
@@ -130,7 +151,11 @@ def train_lstm_model(
         verbose=1
     )
 
-    model.save(model_path)
+    # ✅ ensure directory exists before saving model
+    model_path_p = Path(model_path)
+    model_path_p.parent.mkdir(parents=True, exist_ok=True)
+    model.save(str(model_path_p))
+    print(f"✅ Saved: {model_path_p}")
 
     # -----------------------------
     # 7) Test probs + metrics
@@ -144,7 +169,27 @@ def train_lstm_model(
     metrics_df = pd.DataFrame(metrics)
     metrics_df.to_csv("lstm_next_direction_stdscale_metrics.csv", index=False)
 
-    print("✅ Saved:", model_path)
+    # -----------------------------
+    # 8) ✅ Save LSTM artifacts for RL auto-detect
+    # -----------------------------
+    lstm_artifacts = {
+        "model_path": str(model_path_p),
+        "scaler_path": str(scaler_path_p),
+        "x_window_size": int(x_window_size),
+        "feature_cols": feature_cols,
+        "symbol": symbol,
+        "resolution": resolution,
+        "start_date": start_date,
+        "end_date": end_date,
+        "thresholds_eval": thresholds,
+        "ignore_zone_threshold_for_sideways": 0.52,
+    }
+
+    artifacts_path_p = Path(artifacts_path)
+    artifacts_path_p.parent.mkdir(parents=True, exist_ok=True)
+    dump(lstm_artifacts, str(artifacts_path_p))
+    print(f"✅ Saved: {artifacts_path_p}")
+
     print("✅ Saved: lstm_next_direction_stdscale_test_probs.csv")
     print("✅ Saved: lstm_next_direction_stdscale_metrics.csv")
     print("\n📊 Label balance:")
