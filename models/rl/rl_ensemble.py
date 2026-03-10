@@ -234,14 +234,21 @@ def predict_lstm_series(
 
     lstm_pred = np.full(len(p), 2, dtype=int)
     lstm_pred[p >= upper] = 1
-    lstm_pred[p <= lower] = 0
+    lstm_pred[p < lower] = 0
     lstm_used = (lstm_pred != 2).astype(int)
 
-    end_idx = np.arange(x_window_size, x_window_size + len(p))
+    # Correct alignment for make_windows():
+    # window ends at i-1, target is movement from i-1 -> i
+    signal_idx = np.arange(x_window_size - 1, x_window_size - 1 + len(p))
+    target_idx = signal_idx + 1
 
     out = pd.DataFrame({
-        "timestamp": df.loc[end_idx, "timestamp"].to_list(),
-        "close": df.loc[end_idx, "close"].values.astype(float),
+        "timestamp": df.loc[signal_idx, "timestamp"].to_list(),
+        "close": df.loc[signal_idx, "close"].values.astype(float),
+        "close_next_raw": df.loc[target_idx, "close"].values.astype(float),
+        "actual": (
+            df.loc[target_idx, "close"].values > df.loc[signal_idx, "close"].values
+        ).astype(int),
         "lstm_p_up": p,
         "lstm_pred": lstm_pred,
         "lstm_used": lstm_used,
