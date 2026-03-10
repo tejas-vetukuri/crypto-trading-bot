@@ -1,15 +1,3 @@
-# models/rl/rl_ensemble.py
-# RL meta-controller that calls XGBoost + LSTM predictions and outputs LONG/SHORT/HOLD
-# Includes:
-#  - Robust artifact path resolving relative to project root
-#  - UTC-normalized timestamps for safe merges
-#  - LSTM auto-detect via lstm_artifacts.joblib (model_path, scaler_path, window, feature_cols)
-#  - LSTM produces up/down/sideways with ignore-zone threshold=0.52
-#  - State includes xgb_used + lstm_used
-#  - ✅ Minimal RL fixes:
-#       (1) Hard gate: if BOTH models are sideways => force HOLD
-#       (2) Extra trade penalty (bps) in reward to discourage overtrading
-
 from __future__ import annotations
 
 import math
@@ -30,20 +18,13 @@ from models.lstm.sequence_builder import make_windows
 
 
 # -----------------------------
-# Path helpers (PROJECT ROOT)
+# Path helpers
 # -----------------------------
 
-# This file is: <root>/models/rl/rl_ensemble.py
-# parents[0]=rl, [1]=models, [2]=<root>
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 def resolve_artifact_path(path_like: str) -> str:
-    """
-    Resolve artifact paths robustly.
-    - If absolute => return as-is
-    - If relative => interpret relative to PROJECT_ROOT
-    """
     p = Path(path_like)
     if p.is_absolute():
         return str(p)
@@ -56,8 +37,8 @@ def resolve_artifact_path(path_like: str) -> str:
 
 @dataclass
 class TradeSignal:
-    action: str               # "long" | "short" | "hold"
-    confidence: float         # 0..1
+    action: str
+    confidence: float
     entry: float
     stop_loss: Optional[float]
     take_profit: Optional[float]
@@ -69,13 +50,13 @@ class TradeSignal:
 @dataclass
 class RiskConfig:
     capital_usd: float = 5000.0
-    risk_per_trade: float = 0.02           # 2%
-    rr: float = 2.0                        # 1:2 RR
-    leverage: float = 1.0                  # set 25 if you want
-    fee_bps: float = 2.0                   # rough (entry+exit). adjust
-    trade_penalty_bps: float = 2.0         # ✅ extra discouragement per trade
-    sl_atr_mult: float = 1.5               # SL distance = sl_atr_mult * ATR
-    min_atr_pct: float = 0.001             # fallback ATR% if ATR missing
+    risk_per_trade: float = 0.02
+    rr: float = 2.0
+    leverage: float = 1.0
+    fee_bps: float = 2.0
+    trade_penalty_bps: float = 2.0
+    sl_atr_mult: float = 1.5
+    min_atr_pct: float = 0.001
 
 
 # -----------------------------
@@ -91,7 +72,6 @@ def _clip01(x: float) -> float:
 
 
 def _bucket(x: float, edges: Tuple[float, ...]) -> int:
-    """Return bucket index 0..len(edges) for ascending edges."""
     for i, e in enumerate(edges):
         if x < e:
             return i
@@ -99,8 +79,6 @@ def _bucket(x: float, edges: Tuple[float, ...]) -> int:
 
 
 class QTableAgent:
-    """Tabular Q-learning over discretized state space."""
-
     def __init__(
         self,
         n_states: int,
@@ -185,10 +163,6 @@ def predict_xgb_series(
     df_raw: pd.DataFrame,
     xgb_artifacts_path: str,
 ) -> pd.DataFrame:
-    """
-    Returns df aligned to df_raw AFTER FE and dropna, with:
-      timestamp, close, atr(if exists), xgb_p_up, xgb_used, xgb_pred (0/1/2)
-    """
     artifacts = load(resolve_artifact_path(xgb_artifacts_path))
     model = artifacts["model"]
     features = artifacts["features"]
@@ -222,7 +196,7 @@ def predict_xgb_series(
     out["xgb_margin"] = margin.astype(float)
     out["xgb_boundary"] = decision_boundary
     out["xgb_margin_threshold"] = margin_threshold
-    out["timestamp"] = pd.to_datetime(out["timestamp"], utc=True)  # ✅ harden dtype
+    out["timestamp"] = pd.to_datetime(out["timestamp"], utc=True)
     return out
 
 
@@ -232,15 +206,6 @@ def predict_lstm_series(
     threshold: float = 0.52,
     batch_size: int = 256,
 ) -> pd.DataFrame:
-    """
-    Returns df aligned to END timestamp of each window:
-      timestamp, close, lstm_p_up, lstm_pred (0/1/2), lstm_used (1 if not sideways)
-
-    Sideways defined by ignore zone around 0.5 with threshold=0.52:
-      up   if p >= 0.52
-      down if p <= 0.48
-      sideways otherwise
-    """
     art = load(resolve_artifact_path(lstm_artifacts_path))
     model_path = resolve_artifact_path(art["model_path"])
     scaler_path = resolve_artifact_path(art["scaler_path"])
@@ -264,8 +229,8 @@ def predict_lstm_series(
     Xs = scaler.transform(X.reshape(-1, n_features)).reshape(X.shape).astype(np.float32)
     p = model.predict(Xs, batch_size=batch_size, verbose=0).reshape(-1).astype(float)
 
-    lower = 1.0 - float(threshold)  # 0.48
-    upper = float(threshold)        # 0.52
+    lower = 1.0 - float(threshold)
+    upper = float(threshold)
 
     lstm_pred = np.full(len(p), 2, dtype=int)
     lstm_pred[p >= upper] = 1
@@ -275,36 +240,39 @@ def predict_lstm_series(
     end_idx = np.arange(x_window_size, x_window_size + len(p))
 
     out = pd.DataFrame({
-        "timestamp": df.loc[end_idx, "timestamp"].to_list(),  # ✅ avoid .values tz edge cases
+        "timestamp": df.loc[end_idx, "timestamp"].to_list(),
         "close": df.loc[end_idx, "close"].values.astype(float),
         "lstm_p_up": p,
         "lstm_pred": lstm_pred,
         "lstm_used": lstm_used,
         "lstm_threshold": float(threshold),
     })
-    out["timestamp"] = pd.to_datetime(out["timestamp"], utc=True)  # ✅ harden dtype
+    out["timestamp"] = pd.to_datetime(out["timestamp"], utc=True)
     return out
 
 
 # -----------------------------
-# State builder (includes lstm_used)
+# State builder
 # -----------------------------
+# New state includes:
+#   conf(5) * dis(5) * atr(5) * agree(2) * xgb_used(2) * lstm_used(2) * xgb_pred(3) * lstm_pred(3)
+# = 9000 states
 
 def build_state_index(
     xgb_p: float,
     lstm_p: float,
     xgb_used: int,
     lstm_used: int,
+    xgb_pred: int,
+    lstm_pred: int,
     atr_pct: float,
 ) -> int:
-    """
-    dims:
-      conf(5) * dis(5) * atr(5) * agree(2) * xgb_used(2) * lstm_used(2) = 1000
-    """
     xgb_p = float(xgb_p)
     lstm_p = float(lstm_p)
     xgb_used = int(xgb_used)
     lstm_used = int(lstm_used)
+    xgb_pred = int(xgb_pred)
+    lstm_pred = int(lstm_pred)
     atr_pct = max(0.0, float(atr_pct))
 
     conf_x = abs(xgb_p - 0.5) * 2.0
@@ -321,18 +289,18 @@ def build_state_index(
     b_dis = _bucket(dis, (0.05, 0.10, 0.20, 0.35))
     b_atr = _bucket(atr_pct, (0.002, 0.004, 0.008, 0.015))
 
-    idx = (
-        b_conf
-        + 5 * b_dis
-        + 25 * b_atr
-        + 125 * int(agree)
-        + 250 * int(xgb_used)
-        + 500 * int(lstm_used)
-    )
+    idx = b_conf
+    idx += 5 * b_dis
+    idx += 25 * b_atr
+    idx += 125 * agree
+    idx += 250 * xgb_used
+    idx += 500 * lstm_used
+    idx += 1000 * xgb_pred
+    idx += 3000 * lstm_pred
     return int(idx)
 
 
-N_STATES = 5 * 5 * 5 * 2 * 2 * 2  # 1000
+N_STATES = 5 * 5 * 5 * 2 * 2 * 2 * 3 * 3  # 9000
 
 
 # -----------------------------
@@ -386,13 +354,6 @@ def _reward_from_next_return(
     fee_bps: float,
     trade_penalty_bps: float,
 ) -> float:
-    """
-    Reward proxy:
-      long  => +ret_next
-      short => -ret_next
-      hold  => 0
-    minus fees + extra trade penalty if trade taken.
-    """
     if int(action_idx) == ACTION_TO_IDX["hold"]:
         return 0.0
 
@@ -401,6 +362,36 @@ def _reward_from_next_return(
     fee = float(fee_bps) / 10000.0
     pen = float(trade_penalty_bps) / 10000.0
     return float(pnl - fee - pen)
+
+
+# -----------------------------
+# Shared merged-data builder
+# -----------------------------
+
+def build_merged_dataset(
+    df_raw: pd.DataFrame,
+    xgb_artifacts_path: str,
+    lstm_artifacts_path: str,
+    lstm_threshold: float,
+) -> pd.DataFrame:
+    xgb_df = predict_xgb_series(df_raw, xgb_artifacts_path=xgb_artifacts_path)
+    lstm_df = predict_lstm_series(
+        df_raw,
+        lstm_artifacts_path=lstm_artifacts_path,
+        threshold=lstm_threshold,
+    )
+
+    merged = pd.merge(xgb_df, lstm_df, on=["timestamp", "close"], how="inner")
+    merged = merged.sort_values("timestamp").reset_index(drop=True)
+
+    if len(merged) < 5:
+        raise ValueError("Not enough aligned samples between XGB and LSTM outputs.")
+
+    merged["close_next"] = merged["close"].shift(-1)
+    merged["ret_next"] = (merged["close_next"] / merged["close"]) - 1.0
+    merged = merged.dropna(subset=["ret_next"]).reset_index(drop=True)
+    merged["actual"] = (merged["ret_next"] > 0).astype(int)
+    return merged
 
 
 # -----------------------------
@@ -413,21 +404,16 @@ def train_rl_policy(
     start_date: str = "2019-06-01",
     end_date: str | None = None,
     train_ratio: float = 0.80,
-
     xgb_artifacts_path: str = "models/xgboost/xgb_trend_artifacts.joblib",
     lstm_artifacts_path: str = "models/lstm/lstm_artifacts.joblib",
     lstm_threshold: float = 0.52,
-
     agent_out_path: str = "models/rl/rl_qtable_agent.joblib",
-
     alpha: float = 0.10,
     gamma: float = 0.95,
     eps: float = 0.20,
-    episodes: int = 3,
-
+    episodes: int = 20,
     risk: RiskConfig = RiskConfig(),
 ) -> QTableAgent:
-
     client = DeltaDataClient()
     df_raw = client.get_candles(
         symbol=symbol,
@@ -441,23 +427,14 @@ def train_rl_policy(
     if split <= 0 or split >= n - 2:
         raise ValueError(f"Invalid split: n={n}, split={split}")
 
-    test_raw = df_raw.iloc[split:].copy()
+    train_raw = df_raw.iloc[:split].copy()
 
-    xgb_df = predict_xgb_series(test_raw, xgb_artifacts_path=xgb_artifacts_path)
-    lstm_df = predict_lstm_series(
-        test_raw,
+    merged = build_merged_dataset(
+        df_raw=train_raw,
+        xgb_artifacts_path=xgb_artifacts_path,
         lstm_artifacts_path=lstm_artifacts_path,
-        threshold=lstm_threshold,
+        lstm_threshold=lstm_threshold,
     )
-
-    merged = pd.merge(xgb_df, lstm_df, on=["timestamp", "close"], how="inner")
-    merged = merged.sort_values("timestamp").reset_index(drop=True)
-    if len(merged) < 5:
-        raise ValueError("Not enough aligned samples between XGB and LSTM outputs.")
-
-    merged["close_next"] = merged["close"].shift(-1)
-    merged["ret_next"] = (merged["close_next"] / merged["close"]) - 1.0
-    merged = merged.dropna(subset=["ret_next"]).reset_index(drop=True)
 
     agent = QTableAgent(
         n_states=N_STATES,
@@ -470,7 +447,7 @@ def train_rl_policy(
         seed=42,
     )
 
-    for _ep in range(int(episodes)):
+    for ep in range(int(episodes)):
         for t in range(len(merged) - 1):
             row = merged.iloc[t]
             row2 = merged.iloc[t + 1]
@@ -480,16 +457,16 @@ def train_rl_policy(
                 lstm_p=float(row["lstm_p_up"]),
                 xgb_used=int(row["xgb_used"]),
                 lstm_used=int(row["lstm_used"]),
+                xgb_pred=int(row["xgb_pred"]),
+                lstm_pred=int(row["lstm_pred"]),
                 atr_pct=_compute_atr_pct(row),
             )
 
-            # ✅ Fix (1): hard gate - if both models are sideways => HOLD
             if int(row["xgb_used"]) == 0 and int(row["lstm_used"]) == 0:
                 a = ACTION_TO_IDX["hold"]
             else:
                 a = agent.act(s, greedy=False)
 
-            # ✅ Fix (2): trade penalty in reward
             r = _reward_from_next_return(
                 action_idx=a,
                 ret_next=float(row["ret_next"]),
@@ -502,6 +479,8 @@ def train_rl_policy(
                 lstm_p=float(row2["lstm_p_up"]),
                 xgb_used=int(row2["xgb_used"]),
                 lstm_used=int(row2["lstm_used"]),
+                xgb_pred=int(row2["xgb_pred"]),
+                lstm_pred=int(row2["lstm_pred"]),
                 atr_pct=_compute_atr_pct(row2),
             )
 
@@ -509,6 +488,7 @@ def train_rl_policy(
             agent.update(s, a, r, s2, done)
 
         agent.decay_eps()
+        print(f"Episode {ep + 1}/{episodes} complete | eps={agent.eps:.4f}")
 
     agent.save(agent_out_path)
     print(f"✅ Saved RL agent to {resolve_artifact_path(agent_out_path)}")
@@ -524,15 +504,12 @@ def get_trade_signal_rl(
     resolution: str = "1h",
     start_date: str = "2019-06-01",
     end_date: str | None = None,
-
     xgb_artifacts_path: str = "models/xgboost/xgb_trend_artifacts.joblib",
     lstm_artifacts_path: str = "models/lstm/lstm_artifacts.joblib",
     lstm_threshold: float = 0.52,
-
     rl_agent_path: str = "models/rl/rl_qtable_agent.joblib",
     risk: RiskConfig = RiskConfig(),
 ) -> TradeSignal:
-
     agent = QTableAgent.load(rl_agent_path)
 
     client = DeltaDataClient()
@@ -543,17 +520,12 @@ def get_trade_signal_rl(
         end_date=end_date,
     ).sort_values("timestamp").reset_index(drop=True)
 
-    xgb_df = predict_xgb_series(df_raw, xgb_artifacts_path=xgb_artifacts_path)
-    lstm_df = predict_lstm_series(
-        df_raw,
+    merged = build_merged_dataset(
+        df_raw=df_raw,
+        xgb_artifacts_path=xgb_artifacts_path,
         lstm_artifacts_path=lstm_artifacts_path,
-        threshold=lstm_threshold,
+        lstm_threshold=lstm_threshold,
     )
-
-    merged = pd.merge(xgb_df, lstm_df, on=["timestamp", "close"], how="inner")
-    merged = merged.sort_values("timestamp").reset_index(drop=True)
-    if len(merged) == 0:
-        raise ValueError("No aligned timestamp between XGB and LSTM outputs for inference.")
 
     last = merged.iloc[-1]
     entry = float(last["close"])
@@ -570,10 +542,11 @@ def get_trade_signal_rl(
         lstm_p=float(last["lstm_p_up"]),
         xgb_used=int(last["xgb_used"]),
         lstm_used=int(last["lstm_used"]),
+        xgb_pred=int(last["xgb_pred"]),
+        lstm_pred=int(last["lstm_pred"]),
         atr_pct=float(atr_pct),
     )
 
-    # ✅ Fix (1): hard gate - if both models are sideways => HOLD
     if int(last["xgb_used"]) == 0 and int(last["lstm_used"]) == 0:
         a_idx = ACTION_TO_IDX["hold"]
     else:
@@ -581,7 +554,6 @@ def get_trade_signal_rl(
 
     action = ACTIONS[a_idx]
 
-    # Confidence: combine model confidence + agreement + Q gap
     q = agent.Q[s]
     q_sorted = np.sort(q)
     q_gap = float(q_sorted[-1] - q_sorted[-2]) if len(q_sorted) >= 2 else float(q_sorted[-1])
