@@ -1,4 +1,4 @@
-#eval_rl.py
+# eval_rl.py
 
 import numpy as np
 import pandas as pd
@@ -8,6 +8,7 @@ from data.delta_exchange import DeltaDataClient
 from models.rl.rl_ensemble import (
     QTableAgent,
     ACTIONS,
+    ACTION_TO_IDX,
     build_state_index,
     predict_xgb_series,
     predict_lstm_series,
@@ -26,6 +27,8 @@ def evaluate_rl_agent(
     lstm_threshold: float = 0.52,
     rl_agent_path: str = "models/rl/rl_qtable_agent.joblib",
     fee_bps: float = 2.0,
+    trade_penalty_bps: float = 2.0,  # ✅ NEW: match RL reward signature
+    hard_gate_sideways_hold: bool = True,  # ✅ NEW: match training/inference
 ):
     agent = QTableAgent.load(rl_agent_path)
 
@@ -65,11 +68,22 @@ def evaluate_rl_agent(
             atr_pct=atr_pct,
         )
 
-        a_idx = agent.act(s, greedy=True)
+        # ✅ Hard gate: if BOTH models are sideways => HOLD
+        if hard_gate_sideways_hold and int(row["xgb_used"]) == 0 and int(row["lstm_used"]) == 0:
+            a_idx = ACTION_TO_IDX["hold"]
+        else:
+            a_idx = agent.act(s, greedy=True)
+
         action = ACTIONS[a_idx]
         ret_next = float(row["ret_next"])
 
-        reward = _reward_from_next_return(a_idx, ret_next, fee_bps=fee_bps)
+        # ✅ Updated reward signature
+        reward = _reward_from_next_return(
+            a_idx,
+            ret_next,
+            fee_bps=fee_bps,
+            trade_penalty_bps=trade_penalty_bps,
+        )
 
         actions.append(action)
         rewards.append(reward)
@@ -98,6 +112,9 @@ def evaluate_rl_agent(
     print(f"Total Return:                   {total_return:.4f}")
     print(f"Max Drawdown:                   {max_drawdown:.4f}")
     print(f"Trades taken:                   {sum(a != 'hold' for a in actions)} / {len(actions)}")
+    print(f"Hard-gate sideways hold:        {int(hard_gate_sideways_hold)}")
+    print(f"Fee bps:                        {fee_bps}")
+    print(f"Trade penalty bps:              {trade_penalty_bps}")
 
 
 if __name__ == "__main__":

@@ -1,10 +1,14 @@
 # models/rl/rl_ensemble.py
 # RL meta-controller that calls XGBoost + LSTM predictions and outputs LONG/SHORT/HOLD
-# Fixes in this version:
-#  - Robust artifact path resolving relative to project root (so artifacts can live in models/xgboost, models/lstm)
-#  - LSTM config auto-detected via lstm_artifacts.joblib (model_path, scaler_path, window, feature_cols)
-#  - LSTM produces up/down/sideways with ignore-zone threshold=0.52 (down<=0.48, up>=0.52, else sideways)
+# Includes:
+#  - Robust artifact path resolving relative to project root
+#  - UTC-normalized timestamps for safe merges
+#  - LSTM auto-detect via lstm_artifacts.joblib (model_path, scaler_path, window, feature_cols)
+#  - LSTM produces up/down/sideways with ignore-zone threshold=0.52
 #  - State includes xgb_used + lstm_used
+#  - ✅ Minimal RL fixes:
+#       (1) Hard gate: if BOTH models are sideways => force HOLD
+#       (2) Extra trade penalty (bps) in reward to discourage overtrading
 
 from __future__ import annotations
 
@@ -39,7 +43,6 @@ def resolve_artifact_path(path_like: str) -> str:
     Resolve artifact paths robustly.
     - If absolute => return as-is
     - If relative => interpret relative to PROJECT_ROOT
-    This makes running from PyCharm / different CWD safe.
     """
     p = Path(path_like)
     if p.is_absolute():
@@ -70,6 +73,7 @@ class RiskConfig:
     rr: float = 2.0                        # 1:2 RR
     leverage: float = 1.0                  # set 25 if you want
     fee_bps: float = 2.0                   # rough (entry+exit). adjust
+    trade_penalty_bps: float = 2.0         # ✅ extra discouragement per trade
     sl_atr_mult: float = 1.5               # SL distance = sl_atr_mult * ATR
     min_atr_pct: float = 0.001             # fallback ATR% if ATR missing
 
@@ -207,7 +211,6 @@ def predict_xgb_series(
     margin = np.abs(p_up - decision_boundary)
     xgb_used = (margin >= margin_threshold).astype(int)
 
-    # xgb_pred: 2=sideways when inside ignore zone, else up/down by boundary
     xgb_pred = np.full(len(p_up), 2, dtype=int)
     confident = xgb_used.astype(bool)
     xgb_pred[confident] = (p_up[confident] > decision_boundary).astype(int)
@@ -219,7 +222,7 @@ def predict_xgb_series(
     out["xgb_margin"] = margin.astype(float)
     out["xgb_boundary"] = decision_boundary
     out["xgb_margin_threshold"] = margin_threshold
-    out["timestamp"] = pd.to_datetime(out["timestamp"], utc=True)
+    out["timestamp"] = pd.to_datetime(out["timestamp"], utc=True)  # ✅ harden dtype
     return out
 
 
@@ -259,7 +262,6 @@ def predict_lstm_series(
 
     n_features = X.shape[-1]
     Xs = scaler.transform(X.reshape(-1, n_features)).reshape(X.shape).astype(np.float32)
-
     p = model.predict(Xs, batch_size=batch_size, verbose=0).reshape(-1).astype(float)
 
     lower = 1.0 - float(threshold)  # 0.48
@@ -273,14 +275,14 @@ def predict_lstm_series(
     end_idx = np.arange(x_window_size, x_window_size + len(p))
 
     out = pd.DataFrame({
-        "timestamp": df.loc[end_idx, "timestamp"].values,
+        "timestamp": df.loc[end_idx, "timestamp"].to_list(),  # ✅ avoid .values tz edge cases
         "close": df.loc[end_idx, "close"].values.astype(float),
         "lstm_p_up": p,
         "lstm_pred": lstm_pred,
         "lstm_used": lstm_used,
         "lstm_threshold": float(threshold),
     })
-    out["timestamp"] = pd.to_datetime(out["timestamp"], utc=True)
+    out["timestamp"] = pd.to_datetime(out["timestamp"], utc=True)  # ✅ harden dtype
     return out
 
 
@@ -382,13 +384,23 @@ def _reward_from_next_return(
     action_idx: int,
     ret_next: float,
     fee_bps: float,
+    trade_penalty_bps: float,
 ) -> float:
+    """
+    Reward proxy:
+      long  => +ret_next
+      short => -ret_next
+      hold  => 0
+    minus fees + extra trade penalty if trade taken.
+    """
     if int(action_idx) == ACTION_TO_IDX["hold"]:
         return 0.0
+
     direction = 1.0 if int(action_idx) == ACTION_TO_IDX["long"] else -1.0
     pnl = direction * float(ret_next)
     fee = float(fee_bps) / 10000.0
-    return float(pnl - fee)
+    pen = float(trade_penalty_bps) / 10000.0
+    return float(pnl - fee - pen)
 
 
 # -----------------------------
@@ -471,12 +483,18 @@ def train_rl_policy(
                 atr_pct=_compute_atr_pct(row),
             )
 
-            a = agent.act(s, greedy=False)
+            # ✅ Fix (1): hard gate - if both models are sideways => HOLD
+            if int(row["xgb_used"]) == 0 and int(row["lstm_used"]) == 0:
+                a = ACTION_TO_IDX["hold"]
+            else:
+                a = agent.act(s, greedy=False)
 
+            # ✅ Fix (2): trade penalty in reward
             r = _reward_from_next_return(
                 action_idx=a,
                 ret_next=float(row["ret_next"]),
                 fee_bps=risk.fee_bps,
+                trade_penalty_bps=risk.trade_penalty_bps,
             )
 
             s2 = build_state_index(
@@ -555,9 +573,15 @@ def get_trade_signal_rl(
         atr_pct=float(atr_pct),
     )
 
-    a_idx = agent.act(s, greedy=True)
+    # ✅ Fix (1): hard gate - if both models are sideways => HOLD
+    if int(last["xgb_used"]) == 0 and int(last["lstm_used"]) == 0:
+        a_idx = ACTION_TO_IDX["hold"]
+    else:
+        a_idx = agent.act(s, greedy=True)
+
     action = ACTIONS[a_idx]
 
+    # Confidence: combine model confidence + agreement + Q gap
     q = agent.Q[s]
     q_sorted = np.sort(q)
     q_gap = float(q_sorted[-1] - q_sorted[-2]) if len(q_sorted) >= 2 else float(q_sorted[-1])
@@ -616,5 +640,8 @@ def get_trade_signal_rl(
             "q_long": float(agent.Q[s, ACTION_TO_IDX["long"]]),
             "q_short": float(agent.Q[s, ACTION_TO_IDX["short"]]),
             "lstm_threshold": float(lstm_threshold),
+            "hard_gate_hold": int(int(last["xgb_used"]) == 0 and int(last["lstm_used"]) == 0),
+            "fee_bps": float(risk.fee_bps),
+            "trade_penalty_bps": float(risk.trade_penalty_bps),
         },
     )
