@@ -1,3 +1,7 @@
+from __future__ import annotations
+
+from dataclasses import replace
+
 import numpy as np
 import pandas as pd
 
@@ -7,10 +11,12 @@ from models.rl.rl_ensemble import (
     QTableAgent,
     ACTIONS,
     ACTION_TO_IDX,
-    build_state_index,
+    RiskConfig,
     build_merged_dataset,
+    build_direction_from_ensemble,
+    build_filter_state_index,
     _compute_atr_pct,
-    _reward_from_next_return,
+    simulate_trade_outcome,
 )
 
 
@@ -40,6 +46,162 @@ def _evaluate_three_way_non_hold(actual, pred_3way):
     return acc, int(mask.sum())
 
 
+def _run_rl_trade_simulation(
+    merged: pd.DataFrame,
+    agent: QTableAgent,
+    risk: RiskConfig,
+    ensemble_weight_xgb: float,
+    ensemble_weight_lstm: float,
+    ensemble_upper: float,
+    ensemble_lower: float,
+    max_horizon: int,
+    min_take_visits: int,
+) -> dict:
+    setups = 0
+    taken = 0
+    skipped = 0
+    rewards_r = []
+    gross_rewards_r = []
+    correct_dirs = []
+
+    tp_exits = 0
+    sl_exits = 0
+    horizon_exits = 0
+    other_exits = 0
+
+    equity = 1.0
+    equity_curve = [equity]
+
+    i = 0
+    while i < len(merged) - 1:
+        row = merged.iloc[i]
+
+        direction_name, p_ens_i, _ = build_direction_from_ensemble(
+            xgb_p=float(row["xgb_p_up"]),
+            lstm_p=float(row["lstm_p_up"]),
+            xgb_weight=ensemble_weight_xgb,
+            lstm_weight=ensemble_weight_lstm,
+            upper=ensemble_upper,
+            lower=ensemble_lower,
+        )
+
+        if direction_name == "hold":
+            i += 1
+            continue
+
+        setups += 1
+        side = 1 if direction_name == "long" else 0
+
+        s = build_filter_state_index(
+            p_ens=float(p_ens_i),
+            xgb_p=float(row["xgb_p_up"]),
+            lstm_p=float(row["lstm_p_up"]),
+            atr_pct=_compute_atr_pct(row),
+            side=side,
+        )
+
+        take_visits = int(agent.visits[s, ACTION_TO_IDX["take"]])
+        skip_visits = int(agent.visits[s, ACTION_TO_IDX["skip"]])
+
+        if take_visits < min_take_visits and skip_visits < min_take_visits:
+            decision = "skip"
+            a_idx = ACTION_TO_IDX["skip"]
+        elif take_visits < min_take_visits:
+            decision = "skip"
+            a_idx = ACTION_TO_IDX["skip"]
+        else:
+            a_idx = int(np.argmax(agent.Q[s]))
+            decision = ACTIONS[a_idx]
+
+        if decision == "skip":
+            skipped += 1
+            i += 1
+            continue
+
+        taken += 1
+
+        sim = simulate_trade_outcome(
+            merged=merged,
+            idx=i,
+            direction_name=direction_name,
+            risk=risk,
+            max_horizon=max_horizon,
+        )
+
+        reward_r = float(sim["reward_r"])
+        gross_r = float(sim["gross_r"])
+        exit_reason = str(sim["exit_reason"])
+
+        rewards_r.append(reward_r)
+        gross_rewards_r.append(gross_r)
+        correct_dirs.append(int(gross_r > 0))
+
+        if exit_reason == "tp":
+            tp_exits += 1
+        elif exit_reason in ("sl", "sl_tp_same_bar_sl_first"):
+            sl_exits += 1
+        elif exit_reason == "horizon":
+            horizon_exits += 1
+        else:
+            other_exits += 1
+
+        equity *= (1.0 + float(risk.risk_per_trade) * reward_r)
+        equity_curve.append(equity)
+
+        i = int(sim["exit_index"]) + 1
+
+    direction_accuracy = _safe_mean(correct_dirs)
+    win_rate = _safe_mean([r > 0 for r in rewards_r])
+    avg_r_per_trade = _safe_mean(rewards_r)
+    avg_gross_r_per_trade = _safe_mean(gross_rewards_r)
+    total_return = float(equity - 1.0)
+
+    eq = pd.Series(equity_curve)
+    max_drawdown = float(((eq / eq.cummax()) - 1.0).min()) if len(eq) else 0.0
+
+    return {
+        "setups": setups,
+        "taken": taken,
+        "skipped": skipped,
+        "take_rate": (taken / setups) if setups else 0.0,
+        "directional_accuracy": direction_accuracy,
+        "win_rate": win_rate,
+        "avg_gross_r_per_trade": avg_gross_r_per_trade,
+        "avg_net_r_per_trade": avg_r_per_trade,
+        "total_return": total_return,
+        "max_drawdown": max_drawdown,
+        "tp_exits": tp_exits,
+        "sl_exits": sl_exits,
+        "horizon_exits": horizon_exits,
+        "other_exits": other_exits,
+    }
+
+
+def _print_trade_block(title: str, metrics: dict, risk: RiskConfig, max_horizon: int, min_take_visits: int):
+    print(f"\n---------------- {title} ----------------")
+    print(f"Candidate setups from ensemble:  {metrics['setups']}")
+    print(f"Taken by RL:                     {metrics['taken']}")
+    print(f"Skipped by RL:                   {metrics['skipped']}")
+    print(f"Take rate on setups:             {metrics['take_rate']:.4f}")
+    print(f"Directional Accuracy (taken):    {metrics['directional_accuracy']:.4f}")
+    print(f"Win Rate (taken):                {metrics['win_rate']:.4f}")
+    print(f"Average Gross R / trade:         {metrics['avg_gross_r_per_trade']:.4f}")
+    print(f"Average Net R / trade:           {metrics['avg_net_r_per_trade']:.4f}")
+    print(f"Total Return:                    {metrics['total_return']:.4f}")
+    print(f"Max Drawdown:                    {metrics['max_drawdown']:.4f}")
+    print(f"TP exits:                        {metrics['tp_exits']}")
+    print(f"SL exits:                        {metrics['sl_exits']}")
+    print(f"Horizon exits:                   {metrics['horizon_exits']}")
+    print(f"Other exits:                     {metrics['other_exits']}")
+    print(f"Max horizon:                     {max_horizon}")
+    print(f"Min take visits:                 {min_take_visits}")
+    print(f"RR target:                       {risk.rr:.2f}")
+    print(f"SL ATR multiplier:               {risk.sl_atr_mult:.2f}")
+    print(f"Risk per trade:                  {risk.risk_per_trade:.4f}")
+    print(f"Fee bps:                         {risk.fee_bps}")
+    print(f"Trade penalty bps:               {risk.trade_penalty_bps}")
+
+
 def evaluate_rl_agent(
     symbol: str = "BTCUSD",
     resolution: str = "1h",
@@ -50,13 +212,13 @@ def evaluate_rl_agent(
     lstm_artifacts_path: str = "models/lstm/lstm_artifacts.joblib",
     lstm_threshold: float = 0.52,
     rl_agent_path: str = "models/rl/rl_qtable_agent.joblib",
-    fee_bps: float = 2.0,
-    trade_penalty_bps: float = 2.0,
-    hard_gate_sideways_hold: bool = True,
-    ensemble_weight_xgb: float = 0.50,
-    ensemble_weight_lstm: float = 0.50,
-    ensemble_upper: float = 0.55,
-    ensemble_lower: float = 0.45,
+    risk: RiskConfig = RiskConfig(),
+    ensemble_weight_xgb: float = 0.8,
+    ensemble_weight_lstm: float = 0.2,
+    ensemble_upper: float = 0.60,
+    ensemble_lower: float = 0.40,
+    max_horizon: int = 3,
+    min_take_visits: int = 20,
 ):
     agent = QTableAgent.load(rl_agent_path)
 
@@ -84,9 +246,6 @@ def evaluate_rl_agent(
 
     actual = merged["actual"].values
 
-    # -------------------------
-    # Base model evaluation
-    # -------------------------
     xgb_mask = merged["xgb_pred"].values != 2
     xgb_acc_non_hold, xgb_n = _evaluate_binary_model(
         actual=actual,
@@ -101,15 +260,14 @@ def evaluate_rl_agent(
         mask=lstm_mask,
     )
 
-    # 2-way raw ensemble
     p_ens = (
         ensemble_weight_xgb * merged["xgb_p_up"].values
         + ensemble_weight_lstm * merged["lstm_p_up"].values
-    )
+    ) / (ensemble_weight_xgb + ensemble_weight_lstm)
+
     ens_pred_2way = (p_ens >= 0.5).astype(int)
     ens_acc_2way, ens_n_2way = _evaluate_binary_model(actual=actual, pred=ens_pred_2way)
 
-    # 3-way raw ensemble with hold zone
     ens_pred_3way = np.where(
         p_ens >= ensemble_upper,
         1,
@@ -117,75 +275,38 @@ def evaluate_rl_agent(
     )
     ens_acc_non_hold, ens_n_non_hold = _evaluate_three_way_non_hold(actual, ens_pred_3way)
 
-    # agreement-only ensemble
     xgb_dir = (merged["xgb_p_up"].values >= 0.5).astype(int)
     lstm_dir = (merged["lstm_p_up"].values >= 0.5).astype(int)
     agree_mask = xgb_dir == lstm_dir
     agree_pred = xgb_dir
     agree_acc, agree_n = _evaluate_binary_model(actual=actual, pred=agree_pred, mask=agree_mask)
 
-    # -------------------------
-    # RL evaluation
-    # -------------------------
-    actions = []
-    rewards = []
-    correct_dirs = []
-    equity = 1.0
-    equity_curve = [equity]
+    risk_no_fees = replace(risk, fee_bps=0.0, trade_penalty_bps=0.0)
 
-    for i in range(len(merged)):
-        row = merged.iloc[i]
-        atr_pct = _compute_atr_pct(row)
+    metrics_with_fees = _run_rl_trade_simulation(
+        merged=merged,
+        agent=agent,
+        risk=risk,
+        ensemble_weight_xgb=ensemble_weight_xgb,
+        ensemble_weight_lstm=ensemble_weight_lstm,
+        ensemble_upper=ensemble_upper,
+        ensemble_lower=ensemble_lower,
+        max_horizon=max_horizon,
+        min_take_visits=min_take_visits,
+    )
 
-        s = build_state_index(
-            xgb_p=float(row["xgb_p_up"]),
-            lstm_p=float(row["lstm_p_up"]),
-            xgb_used=int(row["xgb_used"]),
-            lstm_used=int(row["lstm_used"]),
-            xgb_pred=int(row["xgb_pred"]),
-            lstm_pred=int(row["lstm_pred"]),
-            atr_pct=float(atr_pct),
-        )
+    metrics_no_fees = _run_rl_trade_simulation(
+        merged=merged,
+        agent=agent,
+        risk=risk_no_fees,
+        ensemble_weight_xgb=ensemble_weight_xgb,
+        ensemble_weight_lstm=ensemble_weight_lstm,
+        ensemble_upper=ensemble_upper,
+        ensemble_lower=ensemble_lower,
+        max_horizon=max_horizon,
+        min_take_visits=min_take_visits,
+    )
 
-        if hard_gate_sideways_hold and int(row["xgb_used"]) == 0 and int(row["lstm_used"]) == 0:
-            a_idx = ACTION_TO_IDX["hold"]
-        else:
-            a_idx = agent.act(s, greedy=True)
-
-        action = ACTIONS[a_idx]
-        ret_next = float(row["ret_next"])
-
-        reward = _reward_from_next_return(
-            a_idx,
-            ret_next,
-            fee_bps=fee_bps,
-            trade_penalty_bps=trade_penalty_bps,
-        )
-
-        actions.append(action)
-        rewards.append(reward)
-
-        if action != "hold":
-            correct = (
-                (action == "long" and ret_next > 0) or
-                (action == "short" and ret_next < 0)
-            )
-            correct_dirs.append(int(correct))
-
-        equity *= (1 + reward)
-        equity_curve.append(equity)
-
-    rl_non_hold_accuracy = _safe_mean(correct_dirs)
-    traded_rewards = [r for a, r in zip(actions, rewards) if a != "hold"]
-    rl_win_rate = _safe_mean([r > 0 for r in traded_rewards])
-    total_return = float(equity - 1.0)
-
-    eq = pd.Series(equity_curve)
-    max_drawdown = float(((eq / eq.cummax()) - 1.0).min())
-
-    # -------------------------
-    # Print summary
-    # -------------------------
     print("\n================ TEST SET SUMMARY ================")
     print(f"Rows evaluated:                  {len(merged)}")
     print(f"Train ratio used:                {train_ratio:.2f}")
@@ -201,16 +322,37 @@ def evaluate_rl_agent(
     print(f"Ensemble weights:                xgb={ensemble_weight_xgb:.2f}, lstm={ensemble_weight_lstm:.2f}")
     print(f"Ensemble hold band:              [{ensemble_lower:.2f}, {ensemble_upper:.2f}]")
 
-    print("\n---------------- RL Controller ----------------")
-    print(f"Directional Accuracy (non-hold): {rl_non_hold_accuracy:.4f}")
-    print(f"Win Rate (non-hold):             {rl_win_rate:.4f}")
-    print(f"Total Return:                    {total_return:.4f}")
-    print(f"Max Drawdown:                    {max_drawdown:.4f}")
-    print(f"Trades taken:                    {sum(a != 'hold' for a in actions)} / {len(actions)}")
-    print(f"Hard-gate sideways hold:         {int(hard_gate_sideways_hold)}")
-    print(f"Fee bps:                         {fee_bps}")
-    print(f"Trade penalty bps:               {trade_penalty_bps}")
+    _print_trade_block(
+        title="RL Trade Filter (WITH FEES)",
+        metrics=metrics_with_fees,
+        risk=risk,
+        max_horizon=max_horizon,
+        min_take_visits=min_take_visits,
+    )
+
+    _print_trade_block(
+        title="RL Trade Filter (NO FEES)",
+        metrics=metrics_no_fees,
+        risk=risk_no_fees,
+        max_horizon=max_horizon,
+        min_take_visits=min_take_visits,
+    )
 
 
 if __name__ == "__main__":
-    evaluate_rl_agent()
+    evaluate_rl_agent(
+        risk=RiskConfig(
+            capital_usd=5000.0,
+            risk_per_trade=0.02,
+            rr=1.25,
+            leverage=25.0,
+            fee_bps=2.0,
+            trade_penalty_bps=2.0,
+            sl_atr_mult=1.0,
+            min_atr_pct=0.001,
+        ),
+        ensemble_upper=0.60,
+        ensemble_lower=0.40,
+        max_horizon=3,
+        min_take_visits=20,
+    )
