@@ -166,6 +166,49 @@ class QTableAgent:
 
 
 # -----------------------------
+# Decision helper
+# -----------------------------
+
+def choose_action_with_margin(
+    agent: QTableAgent,
+    state_idx: int,
+    min_take_visits: int = 20,
+    q_take_margin: float = 0.0,
+) -> tuple[int, str, dict]:
+    s = int(state_idx)
+
+    q_skip = float(agent.Q[s, ACTION_TO_IDX["skip"]])
+    q_take = float(agent.Q[s, ACTION_TO_IDX["take"]])
+
+    skip_visits = int(agent.visits[s, ACTION_TO_IDX["skip"]])
+    take_visits = int(agent.visits[s, ACTION_TO_IDX["take"]])
+
+    if take_visits < min_take_visits and skip_visits < min_take_visits:
+        a_idx = ACTION_TO_IDX["skip"]
+        decision = "skip"
+    elif take_visits < min_take_visits:
+        a_idx = ACTION_TO_IDX["skip"]
+        decision = "skip"
+    else:
+        if q_take >= q_skip + float(q_take_margin):
+            a_idx = ACTION_TO_IDX["take"]
+            decision = "take"
+        else:
+            a_idx = ACTION_TO_IDX["skip"]
+            decision = "skip"
+
+    info = {
+        "q_skip": q_skip,
+        "q_take": q_take,
+        "q_gap_take_minus_skip": float(q_take - q_skip),
+        "q_take_margin": float(q_take_margin),
+        "skip_visits": skip_visits,
+        "take_visits": take_visits,
+    }
+    return int(a_idx), str(decision), info
+
+
+# -----------------------------
 # Prediction wrappers
 # -----------------------------
 
@@ -798,6 +841,7 @@ def get_trade_signal_rl(
     ensemble_upper: float = 0.60,
     ensemble_lower: float = 0.40,
     min_take_visits: int = 20,
+    q_take_margin: float = 0.0,
 ) -> TradeSignal:
     agent = QTableAgent.load(rl_agent_path)
 
@@ -869,22 +913,16 @@ def get_trade_signal_rl(
         side=side,
     )
 
-    take_visits = int(agent.visits[s, ACTION_TO_IDX["take"]])
-    skip_visits = int(agent.visits[s, ACTION_TO_IDX["skip"]])
+    a_idx, decision, decision_info = choose_action_with_margin(
+        agent=agent,
+        state_idx=s,
+        min_take_visits=min_take_visits,
+        q_take_margin=q_take_margin,
+    )
 
-    if take_visits < min_take_visits and skip_visits < min_take_visits:
-        decision = "skip"
-        a_idx = ACTION_TO_IDX["skip"]
-    elif take_visits < min_take_visits:
-        decision = "skip"
-        a_idx = ACTION_TO_IDX["skip"]
-    else:
-        a_idx = int(np.argmax(agent.Q[s]))
-        decision = ACTIONS[a_idx]
-
-    q = agent.Q[s]
-    q_sorted = np.sort(q)
-    q_gap = float(q_sorted[-1] - q_sorted[-2]) if len(q_sorted) >= 2 else float(q_sorted[-1])
+    q_skip = float(decision_info["q_skip"])
+    q_take = float(decision_info["q_take"])
+    q_gap = float(abs(q_take - q_skip))
     q_conf = _clip01(1.0 - math.exp(-3.0 * max(0.0, q_gap)))
 
     conf_ens = abs(float(p_ens) - 0.5) * 2.0
@@ -918,10 +956,12 @@ def get_trade_signal_rl(
                 "ensemble_direction": direction_name,
                 "rl_decision": "skip",
                 "state": int(s),
-                "q_skip": float(agent.Q[s, ACTION_TO_IDX["skip"]]),
-                "q_take": float(agent.Q[s, ACTION_TO_IDX["take"]]),
-                "take_visits": int(agent.visits[s, ACTION_TO_IDX["take"]]),
-                "skip_visits": int(agent.visits[s, ACTION_TO_IDX["skip"]]),
+                "q_skip": q_skip,
+                "q_take": q_take,
+                "q_gap_take_minus_skip": float(decision_info["q_gap_take_minus_skip"]),
+                "q_take_margin": float(decision_info["q_take_margin"]),
+                "take_visits": int(decision_info["take_visits"]),
+                "skip_visits": int(decision_info["skip_visits"]),
                 "atr": float(atr),
                 "atr_pct": float(atr_pct),
                 "ensemble_upper": float(ensemble_upper),
@@ -965,10 +1005,12 @@ def get_trade_signal_rl(
             "rl_decision": "take",
             "direction_sign": int(direction_sign),
             "state": int(s),
-            "q_skip": float(agent.Q[s, ACTION_TO_IDX["skip"]]),
-            "q_take": float(agent.Q[s, ACTION_TO_IDX["take"]]),
-            "take_visits": int(agent.visits[s, ACTION_TO_IDX["take"]]),
-            "skip_visits": int(agent.visits[s, ACTION_TO_IDX["skip"]]),
+            "q_skip": q_skip,
+            "q_take": q_take,
+            "q_gap_take_minus_skip": float(decision_info["q_gap_take_minus_skip"]),
+            "q_take_margin": float(decision_info["q_take_margin"]),
+            "take_visits": int(decision_info["take_visits"]),
+            "skip_visits": int(decision_info["skip_visits"]),
             "atr": float(atr),
             "atr_pct": float(atr_pct),
             "ensemble_upper": float(ensemble_upper),

@@ -9,14 +9,13 @@ from data.delta_exchange import DeltaDataClient
 
 from models.rl.rl_ensemble import (
     QTableAgent,
-    ACTIONS,
-    ACTION_TO_IDX,
     RiskConfig,
     build_merged_dataset,
     build_direction_from_ensemble,
     build_filter_state_index,
     _compute_atr_pct,
     simulate_trade_outcome,
+    choose_action_with_margin,
 )
 
 
@@ -56,6 +55,7 @@ def _run_rl_trade_simulation(
     ensemble_lower: float,
     max_horizon: int,
     min_take_visits: int,
+    q_take_margin: float,
 ) -> dict:
     setups = 0
     taken = 0
@@ -100,18 +100,12 @@ def _run_rl_trade_simulation(
             side=side,
         )
 
-        take_visits = int(agent.visits[s, ACTION_TO_IDX["take"]])
-        skip_visits = int(agent.visits[s, ACTION_TO_IDX["skip"]])
-
-        if take_visits < min_take_visits and skip_visits < min_take_visits:
-            decision = "skip"
-            a_idx = ACTION_TO_IDX["skip"]
-        elif take_visits < min_take_visits:
-            decision = "skip"
-            a_idx = ACTION_TO_IDX["skip"]
-        else:
-            a_idx = int(np.argmax(agent.Q[s]))
-            decision = ACTIONS[a_idx]
+        _, decision, _ = choose_action_with_margin(
+            agent=agent,
+            state_idx=s,
+            min_take_visits=min_take_visits,
+            q_take_margin=q_take_margin,
+        )
 
         if decision == "skip":
             skipped += 1
@@ -177,7 +171,14 @@ def _run_rl_trade_simulation(
     }
 
 
-def _print_trade_block(title: str, metrics: dict, risk: RiskConfig, max_horizon: int, min_take_visits: int):
+def _print_trade_block(
+    title: str,
+    metrics: dict,
+    risk: RiskConfig,
+    max_horizon: int,
+    min_take_visits: int,
+    q_take_margin: float,
+):
     print(f"\n---------------- {title} ----------------")
     print(f"Candidate setups from ensemble:  {metrics['setups']}")
     print(f"Taken by RL:                     {metrics['taken']}")
@@ -195,6 +196,7 @@ def _print_trade_block(title: str, metrics: dict, risk: RiskConfig, max_horizon:
     print(f"Other exits:                     {metrics['other_exits']}")
     print(f"Max horizon:                     {max_horizon}")
     print(f"Min take visits:                 {min_take_visits}")
+    print(f"Q take margin:                   {q_take_margin:.4f}")
     print(f"RR target:                       {risk.rr:.2f}")
     print(f"SL ATR multiplier:               {risk.sl_atr_mult:.2f}")
     print(f"Risk per trade:                  {risk.risk_per_trade:.4f}")
@@ -219,6 +221,7 @@ def evaluate_rl_agent(
     ensemble_lower: float = 0.40,
     max_horizon: int = 3,
     min_take_visits: int = 20,
+    q_take_margin: float = 0.0,
 ):
     agent = QTableAgent.load(rl_agent_path)
 
@@ -293,6 +296,7 @@ def evaluate_rl_agent(
         ensemble_lower=ensemble_lower,
         max_horizon=max_horizon,
         min_take_visits=min_take_visits,
+        q_take_margin=q_take_margin,
     )
 
     metrics_no_fees = _run_rl_trade_simulation(
@@ -305,6 +309,7 @@ def evaluate_rl_agent(
         ensemble_lower=ensemble_lower,
         max_horizon=max_horizon,
         min_take_visits=min_take_visits,
+        q_take_margin=q_take_margin,
     )
 
     print("\n================ TEST SET SUMMARY ================")
@@ -328,6 +333,7 @@ def evaluate_rl_agent(
         risk=risk,
         max_horizon=max_horizon,
         min_take_visits=min_take_visits,
+        q_take_margin=q_take_margin,
     )
 
     _print_trade_block(
@@ -336,6 +342,7 @@ def evaluate_rl_agent(
         risk=risk_no_fees,
         max_horizon=max_horizon,
         min_take_visits=min_take_visits,
+        q_take_margin=q_take_margin,
     )
 
 
@@ -355,4 +362,5 @@ if __name__ == "__main__":
         ensemble_lower=0.40,
         max_horizon=3,
         min_take_visits=20,
+        q_take_margin=0.20,
     )

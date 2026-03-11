@@ -1,3 +1,9 @@
+# eval_ensemble_only.py
+
+from __future__ import annotations
+
+from dataclasses import replace
+
 import numpy as np
 import pandas as pd
 
@@ -37,91 +43,15 @@ def _evaluate_three_way_non_hold(actual, pred_3way):
     return acc, int(mask.sum())
 
 
-def evaluate_ensemble_only(
-    symbol: str = "BTCUSD",
-    resolution: str = "1h",
-    start_date: str = "2019-06-01",
-    end_date: str | None = None,
-    train_ratio: float = 0.80,
-    xgb_artifacts_path: str = "models/xgboost/xgb_trend_artifacts.joblib",
-    lstm_artifacts_path: str = "models/lstm/lstm_artifacts.joblib",
-    lstm_threshold: float = 0.52,
-    risk: RiskConfig = RiskConfig(),
-    ensemble_weight_xgb: float = 0.8,
-    ensemble_weight_lstm: float = 0.2,
-    ensemble_upper: float = 0.60,
-    ensemble_lower: float = 0.40,
-    max_horizon: int = 12,
-):
-    client = DeltaDataClient()
-    df_raw = client.get_candles(
-        symbol=symbol,
-        resolution=resolution,
-        start_date=start_date,
-        end_date=end_date,
-    ).sort_values("timestamp").reset_index(drop=True)
-
-    n = len(df_raw)
-    split = int(n * train_ratio)
-    if split <= 0 or split >= n - 2:
-        raise ValueError(f"Invalid split: n={n}, split={split}")
-
-    test_raw = df_raw.iloc[split:].copy()
-
-    merged = build_merged_dataset(
-        df_raw=test_raw,
-        xgb_artifacts_path=xgb_artifacts_path,
-        lstm_artifacts_path=lstm_artifacts_path,
-        lstm_threshold=lstm_threshold,
-    )
-
-    actual = merged["actual"].values
-
-    # -------------------------
-    # Base models
-    # -------------------------
-    xgb_mask = merged["xgb_pred"].values != 2
-    xgb_acc_non_hold, xgb_n = _evaluate_binary_model(
-        actual=actual,
-        pred=merged["xgb_pred"].values,
-        mask=xgb_mask,
-    )
-
-    lstm_mask = merged["lstm_pred"].values != 2
-    lstm_acc_non_hold, lstm_n = _evaluate_binary_model(
-        actual=actual,
-        pred=merged["lstm_pred"].values,
-        mask=lstm_mask,
-    )
-
-    # -------------------------
-    # Raw weighted ensemble classification view
-    # -------------------------
-    p_ens = (
-        ensemble_weight_xgb * merged["xgb_p_up"].values
-        + ensemble_weight_lstm * merged["lstm_p_up"].values
-    ) / (ensemble_weight_xgb + ensemble_weight_lstm)
-
-    ens_pred_2way = (p_ens >= 0.5).astype(int)
-    ens_acc_2way, ens_n_2way = _evaluate_binary_model(actual=actual, pred=ens_pred_2way)
-
-    ens_pred_3way = np.where(
-        p_ens >= ensemble_upper,
-        1,
-        np.where(p_ens <= ensemble_lower, 0, 2),
-    )
-    ens_acc_non_hold, ens_n_non_hold = _evaluate_three_way_non_hold(actual, ens_pred_3way)
-
-    xgb_dir = (merged["xgb_p_up"].values >= 0.5).astype(int)
-    lstm_dir = (merged["lstm_p_up"].values >= 0.5).astype(int)
-    agree_mask = xgb_dir == lstm_dir
-    agree_pred = xgb_dir
-    agree_acc, agree_n = _evaluate_binary_model(actual=actual, pred=agree_pred, mask=agree_mask)
-
-    # -------------------------
-    # Ensemble-only trade simulation
-    # Non-overlapping trades
-    # -------------------------
+def _run_ensemble_trade_simulation(
+    merged: pd.DataFrame,
+    risk: RiskConfig,
+    ensemble_weight_xgb: float,
+    ensemble_weight_lstm: float,
+    ensemble_upper: float,
+    ensemble_lower: float,
+    max_horizon: int,
+) -> dict:
     setups = 0
     taken = 0
     rewards_r = []
@@ -140,7 +70,7 @@ def evaluate_ensemble_only(
     while i < len(merged) - 1:
         row = merged.iloc[i]
 
-        direction_name, p_ens_i, direction_sign = build_direction_from_ensemble(
+        direction_name, p_ens_i, _ = build_direction_from_ensemble(
             xgb_p=float(row["xgb_p_up"]),
             lstm_p=float(row["lstm_p_up"]),
             xgb_weight=ensemble_weight_xgb,
@@ -193,7 +123,146 @@ def evaluate_ensemble_only(
     total_return = float(equity - 1.0)
 
     eq = pd.Series(equity_curve)
-    max_drawdown = float(((eq / eq.cummax()) - 1.0).min())
+    max_drawdown = float(((eq / eq.cummax()) - 1.0).min()) if len(eq) else 0.0
+
+    return {
+        "setups": setups,
+        "taken": taken,
+        "skipped": 0,
+        "take_rate": 1.0 if setups else 0.0,
+        "directional_accuracy": direction_accuracy,
+        "win_rate": win_rate,
+        "avg_gross_r_per_trade": avg_gross_r_per_trade,
+        "avg_net_r_per_trade": avg_r_per_trade,
+        "total_return": total_return,
+        "max_drawdown": max_drawdown,
+        "tp_exits": tp_exits,
+        "sl_exits": sl_exits,
+        "horizon_exits": horizon_exits,
+        "other_exits": other_exits,
+    }
+
+
+def _print_trade_block(title: str, metrics: dict, risk: RiskConfig, max_horizon: int):
+    print(f"\n---------------- {title} ----------------")
+    print(f"Candidate setups from ensemble:  {metrics['setups']}")
+    print(f"Taken:                           {metrics['taken']}")
+    print(f"Skipped:                         {metrics['skipped']}")
+    print(f"Take rate on setups:             {metrics['take_rate']:.4f}")
+    print(f"Directional Accuracy (taken):    {metrics['directional_accuracy']:.4f}")
+    print(f"Win Rate (taken):                {metrics['win_rate']:.4f}")
+    print(f"Average Gross R / trade:         {metrics['avg_gross_r_per_trade']:.4f}")
+    print(f"Average Net R / trade:           {metrics['avg_net_r_per_trade']:.4f}")
+    print(f"Total Return:                    {metrics['total_return']:.4f}")
+    print(f"Max Drawdown:                    {metrics['max_drawdown']:.4f}")
+    print(f"TP exits:                        {metrics['tp_exits']}")
+    print(f"SL exits:                        {metrics['sl_exits']}")
+    print(f"Horizon exits:                   {metrics['horizon_exits']}")
+    print(f"Other exits:                     {metrics['other_exits']}")
+    print(f"Max horizon:                     {max_horizon}")
+    print(f"RR target:                       {risk.rr:.2f}")
+    print(f"SL ATR multiplier:               {risk.sl_atr_mult:.2f}")
+    print(f"Risk per trade:                  {risk.risk_per_trade:.4f}")
+    print(f"Fee bps:                         {risk.fee_bps}")
+    print(f"Trade penalty bps:               {risk.trade_penalty_bps}")
+
+
+def evaluate_ensemble_only(
+    symbol: str = "BTCUSD",
+    resolution: str = "1h",
+    start_date: str = "2019-06-01",
+    end_date: str | None = None,
+    train_ratio: float = 0.80,
+    xgb_artifacts_path: str = "models/xgboost/xgb_trend_artifacts.joblib",
+    lstm_artifacts_path: str = "models/lstm/lstm_artifacts.joblib",
+    lstm_threshold: float = 0.52,
+    risk: RiskConfig = RiskConfig(),
+    ensemble_weight_xgb: float = 0.8,
+    ensemble_weight_lstm: float = 0.2,
+    ensemble_upper: float = 0.60,
+    ensemble_lower: float = 0.40,
+    max_horizon: int = 3,
+):
+    client = DeltaDataClient()
+    df_raw = client.get_candles(
+        symbol=symbol,
+        resolution=resolution,
+        start_date=start_date,
+        end_date=end_date,
+    ).sort_values("timestamp").reset_index(drop=True)
+
+    n = len(df_raw)
+    split = int(n * train_ratio)
+    if split <= 0 or split >= n - 2:
+        raise ValueError(f"Invalid split: n={n}, split={split}")
+
+    test_raw = df_raw.iloc[split:].copy()
+
+    merged = build_merged_dataset(
+        df_raw=test_raw,
+        xgb_artifacts_path=xgb_artifacts_path,
+        lstm_artifacts_path=lstm_artifacts_path,
+        lstm_threshold=lstm_threshold,
+    )
+
+    actual = merged["actual"].values
+
+    xgb_mask = merged["xgb_pred"].values != 2
+    xgb_acc_non_hold, xgb_n = _evaluate_binary_model(
+        actual=actual,
+        pred=merged["xgb_pred"].values,
+        mask=xgb_mask,
+    )
+
+    lstm_mask = merged["lstm_pred"].values != 2
+    lstm_acc_non_hold, lstm_n = _evaluate_binary_model(
+        actual=actual,
+        pred=merged["lstm_pred"].values,
+        mask=lstm_mask,
+    )
+
+    p_ens = (
+        ensemble_weight_xgb * merged["xgb_p_up"].values
+        + ensemble_weight_lstm * merged["lstm_p_up"].values
+    ) / (ensemble_weight_xgb + ensemble_weight_lstm)
+
+    ens_pred_2way = (p_ens >= 0.5).astype(int)
+    ens_acc_2way, ens_n_2way = _evaluate_binary_model(actual=actual, pred=ens_pred_2way)
+
+    ens_pred_3way = np.where(
+        p_ens >= ensemble_upper,
+        1,
+        np.where(p_ens <= ensemble_lower, 0, 2),
+    )
+    ens_acc_non_hold, ens_n_non_hold = _evaluate_three_way_non_hold(actual, ens_pred_3way)
+
+    xgb_dir = (merged["xgb_p_up"].values >= 0.5).astype(int)
+    lstm_dir = (merged["lstm_p_up"].values >= 0.5).astype(int)
+    agree_mask = xgb_dir == lstm_dir
+    agree_pred = xgb_dir
+    agree_acc, agree_n = _evaluate_binary_model(actual=actual, pred=agree_pred, mask=agree_mask)
+
+    risk_no_fees = replace(risk, fee_bps=0.0, trade_penalty_bps=0.0)
+
+    metrics_with_fees = _run_ensemble_trade_simulation(
+        merged=merged,
+        risk=risk,
+        ensemble_weight_xgb=ensemble_weight_xgb,
+        ensemble_weight_lstm=ensemble_weight_lstm,
+        ensemble_upper=ensemble_upper,
+        ensemble_lower=ensemble_lower,
+        max_horizon=max_horizon,
+    )
+
+    metrics_no_fees = _run_ensemble_trade_simulation(
+        merged=merged,
+        risk=risk_no_fees,
+        ensemble_weight_xgb=ensemble_weight_xgb,
+        ensemble_weight_lstm=ensemble_weight_lstm,
+        ensemble_upper=ensemble_upper,
+        ensemble_lower=ensemble_lower,
+        max_horizon=max_horizon,
+    )
 
     print("\n================ TEST SET SUMMARY ================")
     print(f"Rows evaluated:                  {len(merged)}")
@@ -210,24 +279,19 @@ def evaluate_ensemble_only(
     print(f"Ensemble weights:                xgb={ensemble_weight_xgb:.2f}, lstm={ensemble_weight_lstm:.2f}")
     print(f"Ensemble hold band:              [{ensemble_lower:.2f}, {ensemble_upper:.2f}]")
 
-    print("\n---------------- Ensemble-Only Trade Simulation ----------------")
-    print(f"Candidate setups from ensemble:  {setups}")
-    print(f"Taken:                           {taken}")
-    print(f"Directional Accuracy (taken):    {direction_accuracy:.4f}")
-    print(f"Win Rate (taken):                {win_rate:.4f}")
-    print(f"Average Gross R / trade:         {avg_gross_r_per_trade:.4f}")
-    print(f"Average Net R / trade:           {avg_r_per_trade:.4f}")
-    print(f"Total Return:                    {total_return:.4f}")
-    print(f"Max Drawdown:                    {max_drawdown:.4f}")
-    print(f"TP exits:                        {tp_exits}")
-    print(f"SL exits:                        {sl_exits}")
-    print(f"Horizon exits:                   {horizon_exits}")
-    print(f"Other exits:                     {other_exits}")
-    print(f"Max horizon:                     {max_horizon}")
-    print(f"Risk per trade:                  {risk.risk_per_trade:.4f}")
-    print(f"RR target:                       {risk.rr:.2f}")
-    print(f"Fee bps:                         {risk.fee_bps}")
-    print(f"Trade penalty bps:               {risk.trade_penalty_bps}")
+    _print_trade_block(
+        title="Ensemble-Only Trade Simulation (WITH FEES)",
+        metrics=metrics_with_fees,
+        risk=risk,
+        max_horizon=max_horizon,
+    )
+
+    _print_trade_block(
+        title="Ensemble-Only Trade Simulation (NO FEES)",
+        metrics=metrics_no_fees,
+        risk=risk_no_fees,
+        max_horizon=max_horizon,
+    )
 
 
 if __name__ == "__main__":
@@ -243,16 +307,16 @@ if __name__ == "__main__":
         risk=RiskConfig(
             capital_usd=5000.0,
             risk_per_trade=0.02,
-            rr=2.0,
+            rr=1.25,
             leverage=25.0,
             fee_bps=2.0,
             trade_penalty_bps=2.0,
-            sl_atr_mult=1.5,
+            sl_atr_mult=1.0,
             min_atr_pct=0.001,
         ),
         ensemble_weight_xgb=0.8,
         ensemble_weight_lstm=0.2,
         ensemble_upper=0.60,
         ensemble_lower=0.40,
-        max_horizon=12,
+        max_horizon=3,
     )
