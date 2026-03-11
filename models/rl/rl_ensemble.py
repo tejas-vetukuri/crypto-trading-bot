@@ -163,6 +163,17 @@ def predict_xgb_series(
     df_raw: pd.DataFrame,
     xgb_artifacts_path: str,
 ) -> pd.DataFrame:
+    """
+    Returns XGB predictions aligned to the CURRENT decision candle:
+      timestamp       = candle t timestamp
+      close           = close[t]
+      close_next_raw  = close[t+1]
+      actual          = 1 if close[t+1] > close[t] else 0
+
+    Plus:
+      atr (if available)
+      xgb_p_up, xgb_used, xgb_pred, xgb_margin, etc.
+    """
     artifacts = load(resolve_artifact_path(xgb_artifacts_path))
     model = artifacts["model"]
     features = artifacts["features"]
@@ -173,11 +184,15 @@ def predict_xgb_series(
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
     df = feature_engineering_xgb(df)
 
-    keep_cols = ["timestamp", "close"]
-    if "atr" in df.columns:
-        keep_cols.append("atr")
-
+    # Keep only rows where model features + close exist
     df = df.dropna(subset=features + ["close"]).reset_index(drop=True)
+
+    # Build next-candle aligned target BEFORE prediction output
+    df["close_next_raw"] = df["close"].shift(-1)
+    df["actual"] = (df["close_next_raw"] > df["close"]).astype(int)
+
+    # Last row has no next candle target
+    df = df.dropna(subset=["close_next_raw"]).reset_index(drop=True)
 
     probs = model.predict_proba(df[features].values)
     p_up = probs[:, 1]
@@ -188,6 +203,10 @@ def predict_xgb_series(
     xgb_pred = np.full(len(p_up), 2, dtype=int)
     confident = xgb_used.astype(bool)
     xgb_pred[confident] = (p_up[confident] > decision_boundary).astype(int)
+
+    keep_cols = ["timestamp", "close", "close_next_raw", "actual"]
+    if "atr" in df.columns:
+        keep_cols.append("atr")
 
     out = df[keep_cols].copy()
     out["xgb_p_up"] = p_up.astype(float)
@@ -381,6 +400,13 @@ def build_merged_dataset(
     lstm_artifacts_path: str,
     lstm_threshold: float,
 ) -> pd.DataFrame:
+    """
+    Build a clean merged dataset where both XGB and LSTM are aligned to the same
+    decision candle and same next-candle target.
+
+    We use the model-provided aligned targets instead of reconstructing target
+    from merged.shift(-1), which can introduce label drift.
+    """
     xgb_df = predict_xgb_series(df_raw, xgb_artifacts_path=xgb_artifacts_path)
     lstm_df = predict_lstm_series(
         df_raw,
@@ -388,16 +414,49 @@ def build_merged_dataset(
         threshold=lstm_threshold,
     )
 
-    merged = pd.merge(xgb_df, lstm_df, on=["timestamp", "close"], how="inner")
+    merged = pd.merge(
+        xgb_df,
+        lstm_df,
+        on="timestamp",
+        how="inner",
+        suffixes=("_xgb", "_lstm"),
+    )
     merged = merged.sort_values("timestamp").reset_index(drop=True)
 
     if len(merged) < 5:
         raise ValueError("Not enough aligned samples between XGB and LSTM outputs.")
 
-    merged["close_next"] = merged["close"].shift(-1)
-    merged["ret_next"] = (merged["close_next"] / merged["close"]) - 1.0
-    merged = merged.dropna(subset=["ret_next"]).reset_index(drop=True)
-    merged["actual"] = (merged["ret_next"] > 0).astype(int)
+    # Sanity checks
+    close_match = np.isclose(
+        merged["close_xgb"].values,
+        merged["close_lstm"].values,
+        rtol=1e-10,
+        atol=1e-10,
+        equal_nan=False,
+    ).mean()
+
+    label_match = (merged["actual_xgb"].values == merged["actual_lstm"].values).mean()
+
+    print(f"Close match on merged rows: {close_match:.4f}")
+    print(f"Label match on merged rows: {label_match:.4f}")
+
+    # Optional hard checks if you want strict validation:
+    # if close_match < 0.999:
+    #     raise ValueError(f"Close mismatch after merge: {close_match:.4f}")
+    # if label_match < 0.999:
+    #     raise ValueError(f"Label mismatch after merge: {label_match:.4f}")
+
+    # Use one consistent aligned target definition
+    # LSTM-side target is fine now that it is aligned correctly
+    merged["close"] = merged["close_lstm"]
+    merged["close_next_raw"] = merged["close_next_raw_lstm"]
+    merged["actual"] = merged["actual_lstm"]
+    merged["ret_next"] = (merged["close_next_raw"] / merged["close"]) - 1.0
+
+    # Keep ATR from XGB side if present
+    if "atr" in merged.columns:
+        merged["atr"] = merged["atr"]
+
     return merged
 
 
