@@ -12,108 +12,69 @@ from sklearn.metrics import (
     confusion_matrix,
     classification_report,
     roc_auc_score,
+    precision_score,
+    recall_score,
+    f1_score,
 )
 
 from data.delta_exchange import DeltaDataClient
 from data.feature_engineering import feature_engineering_lstm
 from models.lstm.confidence_threshold import eval_with_ignore_zone
+from models.lstm.lstm import build_tp_horizon_windows
 
 
-def build_tp_horizon_windows(
-    df: pd.DataFrame,
-    x_window_size: int,
-    feature_cols: list[str],
-    horizon: int = 12,
-    tp_pct: float = 0.02,
-    sl_pct: float = 0.01,
-    skip_ambiguous: bool = True,
+def print_probability_summary(p: np.ndarray):
+    s = pd.Series(p)
+    print("\n📈 Probability summary")
+    print(s.describe())
+
+    bins = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 1.0]
+    bucket_counts = pd.cut(s, bins=bins, include_lowest=True).value_counts().sort_index()
+    print("\n📦 Probability buckets")
+    print(bucket_counts)
+
+
+def evaluate_thresholds(
+    y_true: np.ndarray,
+    p_test: np.ndarray,
+    thresholds: list[float] | tuple[float, ...],
 ):
-    """
-    Build LSTM windows with barrier-based labels.
+    rows = []
 
-    Label definition:
-      y = 1 -> upper TP barrier hit first within horizon
-      y = 0 -> lower SL barrier hit first within horizon
+    print("\n================ THRESHOLD SWEEP ================")
+    for t in thresholds:
+        y_pred = (p_test >= t).astype(int)
 
-    Samples are skipped when:
-      - neither barrier is hit within horizon
-      - both barriers are hit in the same candle and order is unknown
-    """
+        acc = accuracy_score(y_true, y_pred)
+        prec = precision_score(y_true, y_pred, zero_division=0)
+        rec = recall_score(y_true, y_pred, zero_division=0)
+        f1 = f1_score(y_true, y_pred, zero_division=0)
 
-    X_list = []
-    y_list = []
-    meta_rows = []
+        pred_pos = int((y_pred == 1).sum())
+        pred_neg = int((y_pred == 0).sum())
 
-    n = len(df)
-    if n < x_window_size + horizon:
-        raise ValueError(
-            f"Not enough rows for x_window_size={x_window_size} and horizon={horizon}. Got n={n}"
-        )
+        row = {
+            "threshold": float(t),
+            "accuracy": float(acc),
+            "precision": float(prec),
+            "recall": float(rec),
+            "f1": float(f1),
+            "pred_pos": pred_pos,
+            "pred_neg": pred_neg,
+        }
+        rows.append(row)
 
-    for end_idx in range(x_window_size, n - horizon + 1):
-        window = df.iloc[end_idx - x_window_size:end_idx][feature_cols].values.astype(np.float32)
+        print(f"\nThreshold = {t:.2f}")
+        print(f"Predicted positives: {pred_pos}")
+        print(f"Predicted negatives: {pred_neg}")
+        print(f"Accuracy:            {acc:.4f}")
+        print(f"Precision:           {prec:.4f}")
+        print(f"Recall:              {rec:.4f}")
+        print(f"F1:                  {f1:.4f}")
+        print("Confusion matrix:")
+        print(confusion_matrix(y_true, y_pred))
 
-        entry_idx = end_idx - 1
-        entry_price = float(df.iloc[entry_idx]["close"])
-
-        upper_barrier = entry_price * (1.0 + tp_pct)
-        lower_barrier = entry_price * (1.0 - sl_pct)
-
-        future_slice = df.iloc[end_idx:end_idx + horizon]
-
-        label = None
-        hit_step = None
-        outcome = "unresolved"
-
-        for step, row in enumerate(future_slice.itertuples(index=False), start=1):
-            hit_upper = float(row.high) >= upper_barrier
-            hit_lower = float(row.low) <= lower_barrier
-
-            if hit_upper and hit_lower:
-                if skip_ambiguous:
-                    label = None
-                    hit_step = step
-                    outcome = "ambiguous_same_bar"
-                    break
-                label = None
-                hit_step = step
-                outcome = "ambiguous_same_bar"
-                break
-
-            if hit_upper:
-                label = 1
-                hit_step = step
-                outcome = "tp_first"
-                break
-
-            if hit_lower:
-                label = 0
-                hit_step = step
-                outcome = "sl_first"
-                break
-
-        if label is None:
-            continue
-
-        X_list.append(window)
-        y_list.append(label)
-        meta_rows.append(
-            {
-                "entry_idx": entry_idx,
-                "entry_close": entry_price,
-                "upper_barrier": upper_barrier,
-                "lower_barrier": lower_barrier,
-                "hit_step": hit_step,
-                "label": label,
-                "outcome": outcome,
-            }
-        )
-
-    X = np.asarray(X_list, dtype=np.float32)
-    y = np.asarray(y_list, dtype=np.int32)
-    meta_df = pd.DataFrame(meta_rows)
-
-    return X, y, meta_df
+    return pd.DataFrame(rows)
 
 
 def evaluate_lstm_tp_horizon(
@@ -121,24 +82,13 @@ def evaluate_lstm_tp_horizon(
     resolution: str | None = None,
     start_date: str | None = None,
     end_date: str | None = None,
-    artifacts_path: str = "models/lstm/lstm_tp_horizon_artifacts.joblib",
-    thresholds: tuple[float, ...] = (0.50, 0.55, 0.60),
+    artifacts_path: str = "models/lstm/lstm_tp_horizon_artifacts_long.joblib",
+    thresholds: tuple[float, ...] = (0.20, 0.25, 0.30, 0.35, 0.40, 0.50),
     batch_size: int = 64,
+    out_probs_path: str = "models/lstm/lstm_tp_horizon_eval_test_probs_long.csv",
+    out_thresholds_path: str = "models/lstm/lstm_tp_horizon_eval_threshold_sweep_long.csv",
+    out_ignore_zone_path: str = "models/lstm/lstm_tp_horizon_eval_ignore_zone_metrics_long.csv",
 ):
-    """
-    Evaluate saved TP-horizon LSTM model using the artifact config.
-
-    Uses the same:
-      - feature engineering
-      - barrier labeling
-      - chronological 95/5 split
-      - scaler
-    as training.
-    """
-
-    # -----------------------------
-    # 1) Load artifacts
-    # -----------------------------
     artifacts_path_p = Path(artifacts_path)
     if not artifacts_path_p.exists():
         raise FileNotFoundError(f"Artifacts not found: {artifacts_path_p}")
@@ -151,10 +101,12 @@ def evaluate_lstm_tp_horizon(
     feature_cols = list(artifacts["feature_cols"])
 
     target_type = artifacts.get("target_type", "unknown")
+    side = artifacts.get("side", "long")
     horizon = int(artifacts["horizon"])
     tp_pct = float(artifacts["tp_pct"])
     sl_pct = float(artifacts["sl_pct"])
     skip_ambiguous = bool(artifacts.get("skip_ambiguous", True))
+    train_ratio = float(artifacts.get("train_ratio", 0.80))
 
     symbol = symbol or artifacts["symbol"]
     resolution = resolution or artifacts["resolution"]
@@ -163,6 +115,7 @@ def evaluate_lstm_tp_horizon(
 
     print("\n================ LSTM TP-HORIZON EVALUATION ================")
     print(f"Target type:      {target_type}")
+    print(f"Side:             {side}")
     print(f"Symbol:           {symbol}")
     print(f"Resolution:       {resolution}")
     print(f"Start date:       {start_date}")
@@ -171,19 +124,14 @@ def evaluate_lstm_tp_horizon(
     print(f"Horizon:          {horizon}")
     print(f"TP %:             {tp_pct:.4f}")
     print(f"SL %:             {sl_pct:.4f}")
+    print(f"Train ratio:      {train_ratio:.2f}")
     print(f"Skip ambiguous:   {skip_ambiguous}")
     print(f"Model path:       {model_path}")
     print(f"Scaler path:      {scaler_path}")
 
-    # -----------------------------
-    # 2) Load model + scaler
-    # -----------------------------
     model = load_model(model_path)
     scaler = load(scaler_path)
 
-    # -----------------------------
-    # 3) Fetch candles
-    # -----------------------------
     client = DeltaDataClient()
     df = client.get_candles(
         symbol=symbol,
@@ -198,16 +146,9 @@ def evaluate_lstm_tp_horizon(
         raise ValueError(f"Missing required columns: {missing}")
 
     df = df.dropna(subset=list(required)).reset_index(drop=True)
-
-    # -----------------------------
-    # 4) Feature engineering
-    # -----------------------------
     df = feature_engineering_lstm(df)
     df = df.dropna(subset=feature_cols).reset_index(drop=True)
 
-    # -----------------------------
-    # 5) Build windows + labels
-    # -----------------------------
     X, y, meta_df = build_tp_horizon_windows(
         df=df,
         x_window_size=x_window_size,
@@ -215,91 +156,87 @@ def evaluate_lstm_tp_horizon(
         horizon=horizon,
         tp_pct=tp_pct,
         sl_pct=sl_pct,
+        side=side,
         skip_ambiguous=skip_ambiguous,
     )
 
     if len(X) == 0:
         raise ValueError("No labeled samples generated for evaluation.")
 
-    # -----------------------------
-    # 6) Chronological 95/5 split
-    # -----------------------------
     n = len(X)
-    train_end = int(n * 0.95)
+    train_end = int(n * train_ratio)
     if train_end <= 0 or train_end >= n:
-        raise ValueError(f"Not enough samples after labeling. n={n}")
+        raise ValueError(f"Not enough samples after labeling. n={n}, train_end={train_end}")
 
     X_test = X[train_end:]
     y_test = y[train_end:]
     meta_test = meta_df.iloc[train_end:].reset_index(drop=True)
 
-    # -----------------------------
-    # 7) Scale test windows
-    # -----------------------------
+    print("\n📊 Test set")
+    print(f"Samples:          {len(y_test)}")
+    print(f"Positive rate:    {float(y_test.mean()):.4f}")
+    print(f"Negative rate:    {1.0 - float(y_test.mean()):.4f}")
+
     n_features = X_test.shape[-1]
     X_test_s = scaler.transform(X_test.reshape(-1, n_features)).reshape(X_test.shape).astype(np.float32)
 
-    # -----------------------------
-    # 8) Predict
-    # -----------------------------
     p_test = model.predict(X_test_s, batch_size=batch_size, verbose=0).reshape(-1)
-    y_pred_05 = (p_test >= 0.5).astype(int)
 
-    # -----------------------------
-    # 9) Standard metrics
-    # -----------------------------
+    print_probability_summary(p_test)
+
+    y_pred_05 = (p_test >= 0.50).astype(int)
+
     acc = accuracy_score(y_test, y_pred_05)
-    cm = confusion_matrix(y_test, y_pred_05)
-
     try:
         auc = roc_auc_score(y_test, p_test)
     except Exception:
         auc = float("nan")
 
-    print("\n---------------- Basic Metrics ----------------")
-    print(f"Test samples:             {len(y_test)}")
-    print(f"Positive rate (test):     {float(y_test.mean()):.4f}")
-    print(f"Accuracy @0.50:           {acc:.4f}")
-    print(f"ROC-AUC:                  {auc:.4f}")
+    print("\n---------------- Basic Metrics @0.50 ----------------")
+    print(f"Accuracy:      {acc:.4f}")
+    print(f"ROC-AUC:       {auc:.4f}")
+    print("Confusion matrix:")
+    print(confusion_matrix(y_test, y_pred_05))
 
-    print("\n---------------- Confusion Matrix @0.50 ----------------")
-    print(cm)
+    print("\nClassification report @0.50")
+    print(classification_report(y_test, y_pred_05, digits=4, zero_division=0))
 
-    print("\n---------------- Classification Report @0.50 ----------------")
-    print(classification_report(y_test, y_pred_05, digits=4))
+    threshold_df = evaluate_thresholds(y_test, p_test, thresholds)
 
-    # -----------------------------
-    # 10) Ignore-zone metrics
-    # -----------------------------
     ignore_zone_rows = []
-    print("\n---------------- Ignore-Zone Metrics ----------------")
+    print("\n================ IGNORE-ZONE METRICS ================")
     for t in thresholds:
         row = eval_with_ignore_zone(y_test, p_test, threshold=t)
         ignore_zone_rows.append(row)
+
         print(f"\nThreshold = {t}")
         for k, v in row.items():
             print(f"{k}: {v}")
 
-    metrics_df = pd.DataFrame(ignore_zone_rows)
+    ignore_zone_df = pd.DataFrame(ignore_zone_rows)
 
-    # -----------------------------
-    # 11) Save outputs
-    # -----------------------------
     out_df = meta_test.copy()
     out_df["y_true"] = y_test.astype(int)
     out_df["p"] = p_test.astype(float)
     out_df["pred_0_50"] = y_pred_05.astype(int)
 
-    out_probs_path = "lstm_tp_horizon_eval_test_probs.csv"
-    out_metrics_path = "lstm_tp_horizon_eval_metrics.csv"
+    for t in thresholds:
+        col = f"pred_{str(t).replace('.', '_')}"
+        out_df[col] = (p_test >= t).astype(int)
+
+    Path(out_probs_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(out_thresholds_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(out_ignore_zone_path).parent.mkdir(parents=True, exist_ok=True)
 
     out_df.to_csv(out_probs_path, index=False)
-    metrics_df.to_csv(out_metrics_path, index=False)
+    threshold_df.to_csv(out_thresholds_path, index=False)
+    ignore_zone_df.to_csv(out_ignore_zone_path, index=False)
 
     print(f"\n✅ Saved: {out_probs_path}")
-    print(f"✅ Saved: {out_metrics_path}")
+    print(f"✅ Saved: {out_thresholds_path}")
+    print(f"✅ Saved: {out_ignore_zone_path}")
 
-    return out_df, metrics_df
+    return out_df, threshold_df, ignore_zone_df
 
 
 if __name__ == "__main__":

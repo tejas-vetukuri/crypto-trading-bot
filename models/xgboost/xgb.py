@@ -1,54 +1,197 @@
-# xgboost.py
+# models/xgboost/xgb_tp_horizon.py
 
 import numpy as np
 import pandas as pd
+from pathlib import Path
 
 from xgboost import XGBClassifier
-from sklearn.preprocessing import LabelEncoder
-from sklearn.metrics import classification_report, confusion_matrix
-
-from joblib import dump, load
+from sklearn.metrics import (
+    classification_report,
+    confusion_matrix,
+    accuracy_score,
+    roc_auc_score,
+    precision_score,
+    recall_score,
+    f1_score,
+)
+from joblib import dump
 
 from data.delta_exchange import DeltaDataClient
 from data.feature_engineering import feature_engineering_xgb
 
 
-def train_xgb_model(
+def build_tp_horizon_labels(
+    df: pd.DataFrame,
+    horizon: int = 12,
+    tp_pct: float = 0.02,
+    sl_pct: float = 0.01,
+    side: str = "long",
+    skip_ambiguous: bool = True,
+):
+    if side not in {"long", "short"}:
+        raise ValueError(f"side must be 'long' or 'short', got {side}")
+
+    rows = []
+
+    n = len(df)
+    if n < horizon + 1:
+        raise ValueError(f"Not enough rows for horizon={horizon}. Got n={n}")
+
+    for i in range(n - horizon):
+        entry_row = df.iloc[i]
+        entry_price = float(entry_row["close"])
+        timestamp = entry_row["timestamp"] if "timestamp" in df.columns else i
+
+        if side == "long":
+            tp_barrier = entry_price * (1.0 + tp_pct)
+            sl_barrier = entry_price * (1.0 - sl_pct)
+        else:
+            tp_barrier = entry_price * (1.0 - tp_pct)
+            sl_barrier = entry_price * (1.0 + sl_pct)
+
+        future_slice = df.iloc[i + 1:i + 1 + horizon]
+
+        label = None
+        hit_step = None
+        outcome = "unresolved"
+
+        for step, row in enumerate(future_slice.itertuples(index=False), start=1):
+            high = float(row.high)
+            low = float(row.low)
+
+            if side == "long":
+                hit_tp = high >= tp_barrier
+                hit_sl = low <= sl_barrier
+            else:
+                hit_tp = low <= tp_barrier
+                hit_sl = high >= sl_barrier
+
+            if hit_tp and hit_sl:
+                hit_step = step
+                outcome = "ambiguous_same_bar"
+                label = None
+                break
+
+            if hit_tp:
+                label = 1
+                hit_step = step
+                outcome = "tp_first"
+                break
+
+            if hit_sl:
+                label = 0
+                hit_step = step
+                outcome = "sl_first"
+                break
+
+        if label is None:
+            if skip_ambiguous or outcome != "ambiguous_same_bar":
+                continue
+            continue
+
+        rows.append(
+            {
+                "row_idx": i,
+                "timestamp": timestamp,
+                "entry_close": entry_price,
+                "tp_barrier": tp_barrier,
+                "sl_barrier": sl_barrier,
+                "hit_step": hit_step,
+                "label": label,
+                "outcome": outcome,
+                "side": side,
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def print_probability_summary(p: np.ndarray):
+    s = pd.Series(p)
+    print("\n📈 Probability summary")
+    print(s.describe())
+
+    bins = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 1.0]
+    bucket_counts = pd.cut(s, bins=bins, include_lowest=True).value_counts().sort_index()
+    print("\n📦 Probability buckets")
+    print(bucket_counts)
+
+
+def evaluate_thresholds(
+    y_true: np.ndarray,
+    p_test: np.ndarray,
+    thresholds: list[float] | tuple[float, ...],
+):
+    rows = []
+
+    print("\n================ THRESHOLD SWEEP ================")
+    for t in thresholds:
+        y_pred = (p_test >= t).astype(int)
+
+        acc = accuracy_score(y_true, y_pred)
+        prec = precision_score(y_true, y_pred, zero_division=0)
+        rec = recall_score(y_true, y_pred, zero_division=0)
+        f1 = f1_score(y_true, y_pred, zero_division=0)
+
+        pred_pos = int((y_pred == 1).sum())
+        pred_neg = int((y_pred == 0).sum())
+
+        row = {
+            "threshold": float(t),
+            "accuracy": float(acc),
+            "precision": float(prec),
+            "recall": float(rec),
+            "f1": float(f1),
+            "pred_pos": pred_pos,
+            "pred_neg": pred_neg,
+        }
+        rows.append(row)
+
+        print(f"\nThreshold = {t:.2f}")
+        print(f"Predicted positives: {pred_pos}")
+        print(f"Predicted negatives: {pred_neg}")
+        print(f"Accuracy:            {acc:.4f}")
+        print(f"Precision:           {prec:.4f}")
+        print(f"Recall:              {rec:.4f}")
+        print(f"F1:                  {f1:.4f}")
+        print("Confusion matrix:")
+        print(confusion_matrix(y_true, y_pred))
+
+    return pd.DataFrame(rows)
+
+
+def train_xgb_tp_horizon_model(
     symbol: str = "BTCUSD",
     resolution: str = "1h",
     start_date: str = "2019-06-01",
     end_date: str | None = None,
     train_ratio: float = 0.80,
 
-    # Decision boundary (shift from 0.5 to fix skew)
-    decision_boundary: float = 0.46,
+    horizon: int = 12,
+    tp_pct: float = 0.02,
+    sl_pct: float = 0.01,
+    side: str = "long",
+    skip_ambiguous: bool = True,
 
-    # Ignore zone around boundary
-    margin_threshold: float = 0.07,
+    scale_pos_weight: float | None = None,
 
-    # Path to the tuned artifacts that contains best_params
-    tuned_artifacts_path: str = "xgb_tuned_artifacts.joblib",
+    artifacts_path: str | None = None,
+    preds_csv_path: str | None = None,
 
-    artifacts_path: str = "xgb_trend_artifacts.joblib",
-    preds_csv_path: str = "xgb_predictions.csv",
+    thresholds: tuple[float, ...] = (0.20, 0.25, 0.30, 0.35, 0.40, 0.50),
 ):
-    """
-    XGBoost next-direction classifier with:
-      - DeltaDataClient fetch
-      - Feature engineering
-      - Chronological split
-      - Binary labels: down=0, up=1 (stable)
-      - Decision boundary shift + optional ignore zone
-      - Loads tuned hyperparameters from tuned_artifacts_path (best_params)
-      - Artifact saving
+    if side not in {"long", "short"}:
+        raise ValueError(f"side must be 'long' or 'short', got {side}")
 
-    Returns:
-      model, artifacts, output_df
-    """
+    side_suffix = side
 
-    # -----------------------------
-    # 1) Fetch candles
-    # -----------------------------
+    if artifacts_path is None:
+        artifacts_path = f"models/xgboost/xgb_tp_horizon_artifacts_{side_suffix}.joblib"
+    if preds_csv_path is None:
+        preds_csv_path = f"models/xgboost/xgb_tp_horizon_predictions_{side_suffix}.csv"
+
+    threshold_csv_path = f"models/xgboost/xgb_tp_horizon_threshold_sweep_{side_suffix}.csv"
+
     client = DeltaDataClient()
     df = client.get_candles(
         symbol=symbol,
@@ -59,22 +202,34 @@ def train_xgb_model(
 
     df = df.sort_values("timestamp").reset_index(drop=True)
 
-    # -----------------------------
-    # 2) Chronological split
-    # -----------------------------
-    n = len(df)
-    train_end = int(n * train_ratio)
-    if train_end <= 0 or train_end >= n:
-        raise ValueError(f"Invalid split. n={n}, train_end={train_end}")
+    required = {"open", "high", "low", "close", "volume"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}")
 
-    train_df = df.iloc[:train_end].copy()
-    test_df = df.iloc[train_end:].copy()
+    df = feature_engineering_xgb(df)
+    df = df.dropna().reset_index(drop=True)
 
-    # -----------------------------
-    # 3) Feature engineering (separate to avoid leakage)
-    # -----------------------------
-    train_df = feature_engineering_xgb(train_df)
-    test_df = feature_engineering_xgb(test_df)
+    label_df = build_tp_horizon_labels(
+        df=df,
+        horizon=horizon,
+        tp_pct=tp_pct,
+        sl_pct=sl_pct,
+        side=side,
+        skip_ambiguous=skip_ambiguous,
+    )
+
+    if len(label_df) == 0:
+        raise ValueError("No valid labeled samples generated.")
+
+    feature_df = df.iloc[label_df["row_idx"].values].copy().reset_index(drop=True)
+    feature_df["label"] = label_df["label"].values
+    feature_df["entry_close"] = label_df["entry_close"].values
+    feature_df["tp_barrier"] = label_df["tp_barrier"].values
+    feature_df["sl_barrier"] = label_df["sl_barrier"].values
+    feature_df["hit_step"] = label_df["hit_step"].values
+    feature_df["outcome"] = label_df["outcome"].values
+    feature_df["side"] = label_df["side"].values
 
     features = [
         "ema_20", "ema_50", "rsi", "atr",
@@ -86,158 +241,135 @@ def train_xgb_model(
         "vol_chg_1", "vol_chg_5", "vol_z20",
     ]
 
-    X_train = train_df[features]
-    y_train = train_df["actual_trend"].astype(str)
+    missing_features = [c for c in features if c not in feature_df.columns]
+    if missing_features:
+        raise ValueError(f"Missing engineered features: {missing_features}")
 
-    X_test = test_df[features]
-    y_test = test_df["actual_trend"].astype(str)
+    X = feature_df[features].copy()
+    y = feature_df["label"].astype(int).values
 
-    # -----------------------------
-    # 4) Encode labels (stable binary)
-    # -----------------------------
-    # Stable mapping for XGB: up=1, down=0
-    y_train_bin = (y_train.values == "up").astype(int)
-    y_test_bin = (y_test.values == "up").astype(int)
+    n = len(X)
+    train_end = int(n * train_ratio)
+    if train_end <= 0 or train_end >= n:
+        raise ValueError(f"Invalid split. n={n}, train_end={train_end}")
 
-    # Keep LabelEncoder just for artifacts / compatibility
-    le = LabelEncoder()
-    le.fit(y_train)
-    if "up" not in le.classes_ or "down" not in le.classes_:
-        raise ValueError(f"Expected classes to include 'up' and 'down', got {list(le.classes_)}")
+    X_train = X.iloc[:train_end].copy()
+    X_test = X.iloc[train_end:].copy()
+    y_train = y[:train_end]
+    y_test = y[train_end:]
+    meta_test = feature_df.iloc[train_end:].reset_index(drop=True)
 
-    # -----------------------------
-    # 5) Load tuned hyperparameters (best_params)
-    # -----------------------------
-    best_params = None
-    try:
-        tuned_artifacts = load(tuned_artifacts_path)
-        if isinstance(tuned_artifacts, dict) and "best_params" in tuned_artifacts:
-            best_params = tuned_artifacts["best_params"]
-            print(f"✅ Loaded tuned best_params from {tuned_artifacts_path}")
-        else:
-            print(f"⚠️ No 'best_params' found in {tuned_artifacts_path}. Using defaults.")
-    except Exception as e:
-        print(f"⚠️ Could not load tuned artifacts from {tuned_artifacts_path}: {e}")
-        print("⚠️ Using default XGB params.")
+    print("\n📊 TRAIN label stats")
+    print(f"Samples:        {len(y_train)}")
+    print(f"Positive rate:  {float(y_train.mean()):.4f}")
+    print(f"Negative rate:  {1.0 - float(y_train.mean()):.4f}")
+    print(f"Pos count:      {int((y_train == 1).sum())}")
+    print(f"Neg count:      {int((y_train == 0).sum())}")
 
-    # -----------------------------
-    # 6) Train model (binary)
-    # -----------------------------
-    default_params = dict(
+    print("\n📊 TEST label stats")
+    print(f"Samples:        {len(y_test)}")
+    print(f"Positive rate:  {float(y_test.mean()):.4f}")
+    print(f"Negative rate:  {1.0 - float(y_test.mean()):.4f}")
+    print(f"Pos count:      {int((y_test == 1).sum())}")
+    print(f"Neg count:      {int((y_test == 0).sum())}")
+
+    if scale_pos_weight is None:
+        pos = max(int((y_train == 1).sum()), 1)
+        neg = max(int((y_train == 0).sum()), 1)
+        scale_pos_weight = neg / pos
+
+    print(f"\n⚖️ scale_pos_weight: {scale_pos_weight:.6f}")
+
+    model = XGBClassifier(
         objective="binary:logistic",
         eval_metric="logloss",
-        n_estimators=300,
+        n_estimators=400,
         max_depth=6,
         learning_rate=0.05,
         subsample=0.8,
         colsample_bytree=0.8,
         random_state=42,
         tree_method="hist",
+        scale_pos_weight=scale_pos_weight,
     )
 
-    # Merge tuned params over defaults (tuned wins)
-    if isinstance(best_params, dict):
-        model_params = {**default_params, **best_params}
-    else:
-        model_params = default_params
+    model.fit(X_train, y_train)
 
-    # Safety: force the essentials we rely on
-    model_params["objective"] = "binary:logistic"
-    model_params["eval_metric"] = "logloss"
+    p_test = model.predict_proba(X_test)[:, 1]
 
-    model = XGBClassifier(**model_params)
-    model.fit(X_train, y_train_bin)
+    print_probability_summary(p_test)
 
-    # -----------------------------
-    # 7) Predict + Decision Boundary (+ optional ignore zone)
-    # -----------------------------
-    if not (0.0 < decision_boundary < 1.0):
-        raise ValueError(f"decision_boundary must be in (0, 1). Got {decision_boundary}")
+    y_pred_05 = (p_test >= 0.50).astype(int)
 
-    if margin_threshold < 0.0:
-        raise ValueError(f"margin_threshold must be >= 0. Got {margin_threshold}")
+    acc = accuracy_score(y_test, y_pred_05)
+    try:
+        auc = roc_auc_score(y_test, p_test)
+    except Exception:
+        auc = float("nan")
 
-    probs = model.predict_proba(X_test)  # shape (N, 2)
-    p_up = probs[:, 1]                   # because we trained with y_train_bin where up=1
+    print("\n---------------- Basic Metrics @0.50 ----------------")
+    print(f"Accuracy:      {acc:.4f}")
+    print(f"ROC-AUC:       {auc:.4f}")
+    print("Confusion matrix:")
+    print(confusion_matrix(y_test, y_pred_05))
 
-    margin = np.abs(p_up - decision_boundary)
+    print("\nClassification report @0.50")
+    print(classification_report(y_test, y_pred_05, digits=4, zero_division=0))
 
-    final_preds = np.full(len(p_up), 2, dtype=int)  # sideways default
-    confident = margin >= margin_threshold
-    final_preds[confident] = (p_up[confident] > decision_boundary).astype(int)  # 1=up, 0=down
+    threshold_df = evaluate_thresholds(y_test, p_test, thresholds)
 
-    probability_for_pred = np.where(final_preds == 2, decision_boundary, p_up)
-
-    # -----------------------------
-    # 8) Save predictions
-    # -----------------------------
     output_df = pd.DataFrame({
-        "timestamp": test_df["timestamp"].values,
-        "prediction": final_preds,             # 0/1 or 2(sideways)
-        "actual_trend": y_test.values,         # "down"/"up"
-        "p_up": p_up,
-        "decision_boundary": float(decision_boundary),
-        "margin": margin,
-        "used": confident.astype(int),
-        "probability": probability_for_pred,
+        "timestamp": meta_test["timestamp"].values,
+        "y_true": y_test.astype(int),
+        "p_tp_first": p_test.astype(float),
+        "entry_close": meta_test["entry_close"].values,
+        "tp_barrier": meta_test["tp_barrier"].values,
+        "sl_barrier": meta_test["sl_barrier"].values,
+        "hit_step": meta_test["hit_step"].values,
+        "outcome": meta_test["outcome"].values,
+        "side": meta_test["side"].values,
     })
 
+    output_df["pred_0_50"] = y_pred_05.astype(int)
+
+    for t in thresholds:
+        col = f"pred_{str(t).replace('.', '_')}"
+        output_df[col] = (p_test >= t).astype(int)
+
+    Path(preds_csv_path).parent.mkdir(parents=True, exist_ok=True)
+    Path(threshold_csv_path).parent.mkdir(parents=True, exist_ok=True)
+
     output_df.to_csv(preds_csv_path, index=False)
-    print(f"✅ Predictions saved to {preds_csv_path}")
+    threshold_df.to_csv(threshold_csv_path, index=False)
 
-    # -----------------------------
-    # 9) Up/Down-only evaluation (USED trades)
-    # -----------------------------
-    mask = final_preds != 2
-    filtered_preds = final_preds[mask]   # 0/1
-    filtered_true = y_test_bin[mask]     # 0/1
+    print(f"\n✅ Predictions saved to {preds_csv_path}")
+    print(f"✅ Threshold sweep saved to {threshold_csv_path}")
 
-    if len(filtered_preds) > 0:
-        print("\n📊 Classification Report (Up & Down only):")
-        print(classification_report(filtered_true, filtered_preds, target_names=["down", "up"]))
-
-        print("\n🔢 Confusion Matrix:")
-        print(confusion_matrix(filtered_true, filtered_preds))
-    else:
-        print("\n⚠️ No predictions passed the margin threshold.")
-
-    sideways_count = int((final_preds == 2).sum())
-    sideways_pct = (sideways_count / len(final_preds)) * 100
-    print(f"\n➡️ Sideways count: {sideways_count} ({sideways_pct:.2f}%)")
-    print(f"➡️ Decision boundary: {decision_boundary}")
-    print(f"➡️ Margin threshold: {margin_threshold}")
-
-    print("\n📊 Label balance:")
-    print(f"Train UP rate: {float(y_train_bin.mean()):.4f}")
-    print(f"Test  UP rate: {float(y_test_bin.mean()):.4f}")
-
-    # -----------------------------
-    # 10) Save artifacts (includes best_params used)
-    # -----------------------------
     artifacts = {
         "model": model,
-        "label_encoder": le,
         "features": features,
-        "decision_boundary": float(decision_boundary),
-        "margin_threshold": float(margin_threshold),
         "symbol": symbol,
         "resolution": resolution,
         "start_date": start_date,
         "end_date": end_date,
-        "ignore_zone": f"sideways if |p_up-{decision_boundary}| < {margin_threshold}",
-        "best_params_used": model_params,
-        "tuned_artifacts_path": tuned_artifacts_path,
+        "train_ratio": float(train_ratio),
+        "target_type": "tp_before_sl_within_horizon",
+        "side": side,
+        "horizon": int(horizon),
+        "tp_pct": float(tp_pct),
+        "sl_pct": float(sl_pct),
+        "skip_ambiguous": bool(skip_ambiguous),
+        "scale_pos_weight": float(scale_pos_weight),
+        "thresholds_eval": thresholds,
     }
 
-    dump(artifacts, artifacts_path)
-    print(f"✅ Model saved to {artifacts_path}")
+    artifacts_path_p = Path(artifacts_path)
+    artifacts_path_p.parent.mkdir(parents=True, exist_ok=True)
+    dump(artifacts, str(artifacts_path_p))
+    print(f"✅ Model saved to {artifacts_path_p}")
 
-    return model, artifacts, output_df
+    return model, artifacts, output_df, threshold_df
 
 
 if __name__ == "__main__":
-    a = load("xgb_tuned_artifacts.joblib")
-    print(a.keys())
-    print(a["best_params"])
-
-    train_xgb_model()
+    train_xgb_tp_horizon_model()
