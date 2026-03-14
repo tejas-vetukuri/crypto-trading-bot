@@ -7,7 +7,7 @@ from dataclasses import replace
 import numpy as np
 import pandas as pd
 
-from data.delta_exchange import DeltaDataClient
+from data.binance import BinanceDataClient
 
 from models.rl.rl_ensemble import (
     RiskConfig,
@@ -168,7 +168,7 @@ def _print_trade_block(title: str, metrics: dict, risk: RiskConfig, max_horizon:
 
 
 def evaluate_ensemble_only(
-    symbol: str = "BTCUSD",
+    symbol: str = "BTCUSDT",
     resolution: str = "1h",
     start_date: str = "2019-06-01",
     end_date: str | None = None,
@@ -183,7 +183,7 @@ def evaluate_ensemble_only(
     ensemble_lower: float = 0.40,
     max_horizon: int = 3,
 ):
-    client = DeltaDataClient()
+    client = BinanceDataClient()
     df_raw = client.get_candles(
         symbol=symbol,
         resolution=resolution,
@@ -296,9 +296,9 @@ def evaluate_ensemble_only(
 
 if __name__ == "__main__":
     evaluate_ensemble_only(
-        symbol="BTCUSD",
+        symbol="BTCUSDT",
         resolution="1h",
-        start_date="2019-06-01",
+        start_date="2017-09-01",
         end_date=None,
         train_ratio=0.80,
         xgb_artifacts_path="models/xgboost/xgb_trend_artifacts.joblib",

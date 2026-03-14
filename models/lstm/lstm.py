@@ -12,14 +12,14 @@ from tensorflow.keras.optimizers import Adam
 
 from joblib import dump  # ✅
 
-from data.delta_exchange import DeltaDataClient
+from data.binance import BinanceDataClient
 from data.feature_engineering import feature_engineering_lstm
 from models.lstm.sequence_builder import make_windows
 from models.lstm.confidence_threshold import eval_with_ignore_zone
 
 
 def train_lstm_model(
-    symbol: str = "BTCUSD",
+    symbol: str = "BTCUSDT",
     resolution: str = "1h",
     start_date: str = "2019-06-01",
     end_date: str | None = None,
@@ -55,7 +55,7 @@ def train_lstm_model(
     # -----------------------------
     # 1) Fetch candles
     # -----------------------------
-    client = DeltaDataClient()
+    client = BinanceDataClient(market="spot")
     df = client.get_candles(
         symbol=symbol,
         resolution=resolution,
