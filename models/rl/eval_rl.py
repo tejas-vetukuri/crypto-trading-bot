@@ -7,7 +7,7 @@ from dataclasses import replace
 import numpy as np
 import pandas as pd
 
-from data.delta_exchange import DeltaDataClient
+from data.binance import BinanceDataClient
 
 from models.rl.rl_ensemble import (
     QTableAgent,
@@ -175,27 +175,27 @@ def _run_rl_trade_simulation(
 
 def _print_trade_block(
     title: str,
-    metrics: dict,
+    metrics_with_fees: dict,
+    metrics_no_fees: dict,
     risk: RiskConfig,
     max_horizon: int,
     min_take_visits: int,
     q_take_margin: float,
 ):
     print(f"\n---------------- {title} ----------------")
-    print(f"Candidate setups from ensemble:  {metrics['setups']}")
-    print(f"Taken by RL:                     {metrics['taken']}")
-    print(f"Skipped by RL:                   {metrics['skipped']}")
-    print(f"Take rate on setups:             {metrics['take_rate']:.4f}")
-    print(f"Directional Accuracy (taken):    {metrics['directional_accuracy']:.4f}")
-    print(f"Win Rate (taken):                {metrics['win_rate']:.4f}")
-    print(f"Average Gross R / trade:         {metrics['avg_gross_r_per_trade']:.4f}")
-    print(f"Average Net R / trade:           {metrics['avg_net_r_per_trade']:.4f}")
-    print(f"Total Return:                    {metrics['total_return']:.4f}")
-    print(f"Max Drawdown:                    {metrics['max_drawdown']:.4f}")
-    print(f"TP exits:                        {metrics['tp_exits']}")
-    print(f"SL exits:                        {metrics['sl_exits']}")
-    print(f"Horizon exits:                   {metrics['horizon_exits']}")
-    print(f"Other exits:                     {metrics['other_exits']}")
+    print(f"Candidate setups from ensemble:  {metrics_with_fees['setups']}")
+    print(f"Taken by RL:                     {metrics_with_fees['taken']}")
+    print(f"Skipped by RL:                   {metrics_with_fees['skipped']}")
+    print(f"Average Gross R / trade:         {metrics_with_fees['avg_gross_r_per_trade']:.4f}")
+    print(f"Average Net R / trade:           {metrics_with_fees['avg_net_r_per_trade']:.4f}")
+    print(f"Total Return:                    {metrics_with_fees['total_return']:.4f}")
+    print(f"Total Return (no fees):          {metrics_no_fees['total_return']:.4f}")
+    print(f"Max Drawdown:                    {metrics_with_fees['max_drawdown']:.4f}")
+    print(f"Max Drawdown (no fees):          {metrics_no_fees['max_drawdown']:.4f}")
+    print(f"TP exits:                        {metrics_with_fees['tp_exits']}")
+    print(f"SL exits:                        {metrics_with_fees['sl_exits']}")
+    print(f"Horizon exits:                   {metrics_with_fees['horizon_exits']}")
+    print(f"Other exits:                     {metrics_with_fees['other_exits']}")
     print(f"Max horizon:                     {max_horizon}")
     print(f"Min take visits:                 {min_take_visits}")
     print(f"Q take margin:                   {q_take_margin:.4f}")
@@ -207,9 +207,9 @@ def _print_trade_block(
 
 
 def evaluate_rl_agent(
-    symbol: str = "BTCUSD",
+    symbol: str = "BTCUSDT",
     resolution: str = "1h",
-    start_date: str = "2019-06-01",
+    start_date: str = "2017-09-01",
     end_date: str | None = None,
     train_ratio: float = 0.80,
     xgb_artifacts_path: str = "models/xgboost/xgb_trend_artifacts.joblib",
@@ -227,7 +227,7 @@ def evaluate_rl_agent(
 ):
     agent = QTableAgent.load(rl_agent_path)
 
-    client = DeltaDataClient()
+    client = BinanceDataClient(market="spot")
     df_raw = client.get_candles(
         symbol=symbol,
         resolution=resolution,
@@ -330,18 +330,10 @@ def evaluate_rl_agent(
     print(f"Ensemble hold band:              [{ensemble_lower:.2f}, {ensemble_upper:.2f}]")
 
     _print_trade_block(
-        title="RL Trade Filter (WITH FEES)",
-        metrics=metrics_with_fees,
+        title="RL Trade Filter",
+        metrics_with_fees=metrics_with_fees,
+        metrics_no_fees=metrics_no_fees,
         risk=risk,
-        max_horizon=max_horizon,
-        min_take_visits=min_take_visits,
-        q_take_margin=q_take_margin,
-    )
-
-    _print_trade_block(
-        title="RL Trade Filter (NO FEES)",
-        metrics=metrics_no_fees,
-        risk=risk_no_fees,
         max_horizon=max_horizon,
         min_take_visits=min_take_visits,
         q_take_margin=q_take_margin,

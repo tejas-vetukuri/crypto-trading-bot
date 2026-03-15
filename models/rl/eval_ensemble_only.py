@@ -1,4 +1,4 @@
-# eval_ensemble_only.py
+#eval_ensemble_only.py
 
 from __future__ import annotations
 
@@ -143,22 +143,27 @@ def _run_ensemble_trade_simulation(
     }
 
 
-def _print_trade_block(title: str, metrics: dict, risk: RiskConfig, max_horizon: int):
+def _print_trade_block(
+    title: str,
+    metrics_with_fees: dict,
+    metrics_no_fees: dict,
+    risk: RiskConfig,
+    max_horizon: int,
+):
     print(f"\n---------------- {title} ----------------")
-    print(f"Candidate setups from ensemble:  {metrics['setups']}")
-    print(f"Taken:                           {metrics['taken']}")
-    print(f"Skipped:                         {metrics['skipped']}")
-    print(f"Take rate on setups:             {metrics['take_rate']:.4f}")
-    print(f"Directional Accuracy (taken):    {metrics['directional_accuracy']:.4f}")
-    print(f"Win Rate (taken):                {metrics['win_rate']:.4f}")
-    print(f"Average Gross R / trade:         {metrics['avg_gross_r_per_trade']:.4f}")
-    print(f"Average Net R / trade:           {metrics['avg_net_r_per_trade']:.4f}")
-    print(f"Total Return:                    {metrics['total_return']:.4f}")
-    print(f"Max Drawdown:                    {metrics['max_drawdown']:.4f}")
-    print(f"TP exits:                        {metrics['tp_exits']}")
-    print(f"SL exits:                        {metrics['sl_exits']}")
-    print(f"Horizon exits:                   {metrics['horizon_exits']}")
-    print(f"Other exits:                     {metrics['other_exits']}")
+    print(f"Candidate setups from ensemble:  {metrics_with_fees['setups']}")
+    print(f"Taken by RL:                     {metrics_with_fees['taken']}")
+    print(f"Skipped by RL:                   {metrics_with_fees['skipped']}")
+    print(f"Average Gross R / trade:         {metrics_with_fees['avg_gross_r_per_trade']:.4f}")
+    print(f"Average Net R / trade:           {metrics_with_fees['avg_net_r_per_trade']:.4f}")
+    print(f"Total Return:                    {metrics_with_fees['total_return']:.4f}")
+    print(f"Total Return (no fees):          {metrics_no_fees['total_return']:.4f}")
+    print(f"Max Drawdown:                    {metrics_with_fees['max_drawdown']:.4f}")
+    print(f"Max Drawdown (no fees):          {metrics_no_fees['max_drawdown']:.4f}")
+    print(f"TP exits:                        {metrics_with_fees['tp_exits']}")
+    print(f"SL exits:                        {metrics_with_fees['sl_exits']}")
+    print(f"Horizon exits:                   {metrics_with_fees['horizon_exits']}")
+    print(f"Other exits:                     {metrics_with_fees['other_exits']}")
     print(f"Max horizon:                     {max_horizon}")
     print(f"RR target:                       {risk.rr:.2f}")
     print(f"SL ATR multiplier:               {risk.sl_atr_mult:.2f}")
@@ -280,16 +285,10 @@ def evaluate_ensemble_only(
     print(f"Ensemble hold band:              [{ensemble_lower:.2f}, {ensemble_upper:.2f}]")
 
     _print_trade_block(
-        title="Ensemble-Only Trade Simulation (WITH FEES)",
-        metrics=metrics_with_fees,
+        title="Ensemble-Only Trade Simulation",
+        metrics_with_fees=metrics_with_fees,
+        metrics_no_fees=metrics_no_fees,
         risk=risk,
-        max_horizon=max_horizon,
-    )
-
-    _print_trade_block(
-        title="Ensemble-Only Trade Simulation (NO FEES)",
-        metrics=metrics_no_fees,
-        risk=risk_no_fees,
         max_horizon=max_horizon,
     )
 
