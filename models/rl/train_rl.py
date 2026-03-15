@@ -3,9 +3,9 @@ from models.rl.rl_ensemble import train_rl_policy, RiskConfig
 
 if __name__ == "__main__":
     train_rl_policy(
-        symbol="BTCUSD",
+        symbol="BTCUSDT",
         resolution="1h",
-        start_date="2019-06-01",
+        start_date="2017-06-01",
         end_date=None,
         train_ratio=0.80,
         xgb_artifacts_path="models/xgboost/xgb_trend_artifacts.joblib",

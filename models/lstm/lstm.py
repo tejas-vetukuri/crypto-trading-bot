@@ -21,7 +21,7 @@ from models.lstm.confidence_threshold import eval_with_ignore_zone
 def train_lstm_model(
     symbol: str = "BTCUSDT",
     resolution: str = "1h",
-    start_date: str = "2019-06-01",
+    start_date: str = "2017-09-01",
     end_date: str | None = None,
     x_window_size: int = 100,
     epochs: int = 10,

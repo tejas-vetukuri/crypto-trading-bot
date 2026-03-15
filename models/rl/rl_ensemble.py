@@ -12,7 +12,7 @@ from joblib import load, dump
 from tensorflow.keras.models import load_model
 from sklearn.preprocessing import StandardScaler
 
-from data.delta_exchange import DeltaDataClient
+from data.binance import BinanceDataClient
 from data.feature_engineering import feature_engineering_xgb, feature_engineering_lstm
 from models.lstm.sequence_builder import make_windows
 
@@ -703,9 +703,9 @@ def _next_state_from_index(
 # -----------------------------
 
 def train_rl_policy(
-    symbol: str = "BTCUSD",
+    symbol: str = "BTCUSDT",
     resolution: str = "1h",
-    start_date: str = "2019-06-01",
+    start_date: str = "2017-09-01",
     end_date: str | None = None,
     train_ratio: float = 0.80,
     xgb_artifacts_path: str = "models/xgboost/xgb_trend_artifacts.joblib",
@@ -724,7 +724,7 @@ def train_rl_policy(
     max_horizon: int = 3,
     skip_reward_scale: float = 0.15,
 ) -> QTableAgent:
-    client = DeltaDataClient()
+    client = BinanceDataClient(market="spot")
     df_raw = client.get_candles(
         symbol=symbol,
         resolution=resolution,
@@ -827,9 +827,9 @@ def train_rl_policy(
 # -----------------------------
 
 def get_trade_signal_rl(
-    symbol: str = "BTCUSD",
+    symbol: str = "BTCUSDT",
     resolution: str = "1h",
-    start_date: str = "2019-06-01",
+    start_date: str = "2017-09-01",
     end_date: str | None = None,
     xgb_artifacts_path: str = "models/xgboost/xgb_trend_artifacts.joblib",
     lstm_artifacts_path: str = "models/lstm/lstm_artifacts.joblib",
@@ -845,7 +845,7 @@ def get_trade_signal_rl(
 ) -> TradeSignal:
     agent = QTableAgent.load(rl_agent_path)
 
-    client = DeltaDataClient()
+    client = BinanceDataClient(market="spot")
     df_raw = client.get_candles(
         symbol=symbol,
         resolution=resolution,
