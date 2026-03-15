@@ -356,5 +356,5 @@ if __name__ == "__main__":
         ensemble_lower=0.40,
         max_horizon=3,
         min_take_visits=20,
-        q_take_margin=0.20,
+        q_take_margin=0.38,
     )
