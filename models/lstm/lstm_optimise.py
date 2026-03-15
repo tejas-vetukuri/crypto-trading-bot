@@ -1,18 +1,3 @@
-# lstm_optimise.py
-#
-# Small (non-huge) time-series-safe tuning for your LSTM:
-# - Chronological split: train/test (default 95/5)
-# - Inside train: subtrain/val (default last 10% of train as val)
-# - Train-only StandardScaler (fit on subtrain windows)
-# - Small random search over a compact space (window, units, dropout, lr, batch)
-# - Select best by validation logloss (probability quality)
-# - Retrain best model on full train (subtrain+val) WITHOUT early stopping
-# - Saves:
-#   - lstm_tuning_results.csv (all trials)
-#   - lstm_best_model.keras
-#   - lstm_best_artifacts.joblib (best_params, scaler, feature_cols, etc.)
-#   - lstm_best_test_probs.csv + lstm_best_test_metrics.csv
-
 import os
 import random
 from dataclasses import dataclass
@@ -24,7 +9,12 @@ import pandas as pd
 from joblib import dump
 
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import log_loss, roc_auc_score
+from sklearn.metrics import (
+    log_loss,
+    roc_auc_score,
+    balanced_accuracy_score,
+)
+from sklearn.utils.class_weight import compute_class_weight
 
 import tensorflow as tf
 from tensorflow.keras.models import Sequential
@@ -32,7 +22,7 @@ from tensorflow.keras.layers import LSTM, Dense, Dropout, Input
 from tensorflow.keras.callbacks import EarlyStopping
 from tensorflow.keras.optimizers import Adam
 
-from data.delta_exchange import DeltaDataClient
+from data.binance import BinanceDataClient
 from data.feature_engineering import feature_engineering_lstm
 from models.lstm.sequence_builder import make_windows
 from models.lstm.confidence_threshold import eval_with_ignore_zone
@@ -46,6 +36,32 @@ def set_global_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     tf.random.set_seed(seed)
+
+
+# -----------------------------
+# Target creation (same as XGB)
+# -----------------------------
+def create_vol_adjusted_binary_target(
+    df: pd.DataFrame,
+    horizon: int = 12,
+    vol_window: int = 24,
+) -> pd.DataFrame:
+    df = df.copy()
+
+    df["log_ret_1_raw"] = np.log(df["close"] / df["close"].shift(1))
+    df["sigma_t"] = df["log_ret_1_raw"].rolling(vol_window).std()
+    df["sigma_h"] = df["sigma_t"] * np.sqrt(horizon)
+
+    df["future_close"] = df["close"].shift(-horizon)
+    df["forward_log_return"] = np.log(df["future_close"] / df["close"])
+
+    eps = 1e-12
+    df["target_score"] = df["forward_log_return"] / (df["sigma_h"] + eps)
+
+    df["actual_trend"] = np.where(df["target_score"] > 0, "up", "down")
+    df["target"] = (df["actual_trend"] == "up").astype(np.int32)
+
+    return df
 
 
 # -----------------------------
@@ -73,15 +89,17 @@ def build_lstm_model(
 
 
 # -----------------------------
-# Data prep (one pass per window size)
+# Data prep
 # -----------------------------
 def fetch_and_engineer(
     symbol: str,
     resolution: str,
     start_date: str,
     end_date: str | None,
+    horizon: int,
+    vol_window: int,
 ) -> pd.DataFrame:
-    client = DeltaDataClient()
+    client = BinanceDataClient(market="spot")
     df = client.get_candles(
         symbol=symbol,
         resolution=resolution,
@@ -89,13 +107,34 @@ def fetch_and_engineer(
         end_date=end_date,
     )
 
-    required = {"open", "high", "low", "close", "volume"}
+    required = {"timestamp", "open", "high", "low", "close", "volume"}
     missing = required - set(df.columns)
     if missing:
         raise ValueError(f"Missing required columns: {missing}")
 
-    df = df.dropna(subset=list(required)).reset_index(drop=True)
+    df = df.sort_values("timestamp").reset_index(drop=True)
+    df = df.dropna(subset=["open", "high", "low", "close", "volume"]).reset_index(drop=True)
+
+    df = create_vol_adjusted_binary_target(
+        df=df,
+        horizon=horizon,
+        vol_window=vol_window,
+    )
+
+    df = df.dropna(
+        subset=[
+            "future_close",
+            "forward_log_return",
+            "sigma_t",
+            "sigma_h",
+            "target_score",
+            "actual_trend",
+            "target",
+        ]
+    ).reset_index(drop=True)
+
     df = feature_engineering_lstm(df)
+
     return df
 
 
@@ -106,9 +145,14 @@ def make_scaled_splits_for_window(
     train_ratio: float,
     val_ratio_within_train: float,
 ) -> dict[str, Any]:
-    df = df.dropna(subset=feature_cols).reset_index(drop=True)
+    df = df.dropna(subset=feature_cols + ["target"]).reset_index(drop=True)
 
-    X, y = make_windows(df, x_window_size=x_window_size, feature_cols=feature_cols)
+    X, y = make_windows(
+        df,
+        x_window_size=x_window_size,
+        feature_cols=feature_cols,
+        target_col="target",
+    )
     X = np.asarray(X, dtype=np.float32)
     y = np.asarray(y, dtype=np.int32)
 
@@ -119,6 +163,10 @@ def make_scaled_splits_for_window(
     if X.shape[2] != len(feature_cols):
         raise ValueError(f"Expected F={len(feature_cols)}, got {X.shape[2]}")
 
+    meta_df = df.iloc[x_window_size:].reset_index(drop=True)
+    if len(meta_df) != len(y):
+        raise ValueError(f"meta_df length {len(meta_df)} does not match y length {len(y)}")
+
     n = len(X)
     train_end = int(n * train_ratio)
     if train_end <= 0 or train_end >= n:
@@ -126,6 +174,7 @@ def make_scaled_splits_for_window(
 
     X_train_full, X_test = X[:train_end], X[train_end:]
     y_train_full, y_test = y[:train_end], y[train_end:]
+    meta_train_full, meta_test = meta_df.iloc[:train_end].copy(), meta_df.iloc[train_end:].copy()
 
     subtrain_end = int(len(X_train_full) * (1.0 - val_ratio_within_train))
     if subtrain_end <= 0 or subtrain_end >= len(X_train_full):
@@ -135,6 +184,7 @@ def make_scaled_splits_for_window(
 
     X_sub, X_val = X_train_full[:subtrain_end], X_train_full[subtrain_end:]
     y_sub, y_val = y_train_full[:subtrain_end], y_train_full[subtrain_end:]
+    meta_sub, meta_val = meta_train_full.iloc[:subtrain_end].copy(), meta_train_full.iloc[subtrain_end:].copy()
 
     n_features = X_sub.shape[-1]
     scaler = StandardScaler()
@@ -148,12 +198,16 @@ def make_scaled_splits_for_window(
     return {
         "X_sub": scale(X_sub),
         "y_sub": y_sub,
+        "meta_sub": meta_sub,
         "X_val": scale(X_val),
         "y_val": y_val,
+        "meta_val": meta_val,
         "X_train_full": scale(X_train_full),
         "y_train_full": y_train_full,
+        "meta_train_full": meta_train_full,
         "X_test": scale(X_test),
         "y_test": y_test,
+        "meta_test": meta_test,
         "scaler": scaler,
         "n_features": n_features,
         "n_total": n,
@@ -180,22 +234,13 @@ def sample_trials(
     n_trials: int,
     seed: int = 42,
 ) -> list[TrialConfig]:
-    """
-    Compact search space (not huge):
-      window_size: 72/96/120   (3)
-      units: 64/100            (2)
-      dropout: 0.1/0.2/0.3     (3)
-      lr: 1e-3/7e-4            (2)  <-- adjusted for short training (5 epochs)
-      batch: 64/128            (2)
-
-    Total combos = 72; we sample n_trials randomly WITHOUT duplicates.
-    """
     rng = np.random.default_rng(seed)
 
-    window_sizes = [72, 96, 120]
-    units_list = [64, 100]
+    # slightly broader / safer search
+    window_sizes = [48, 72, 96, 120]
+    units_list = [32, 64, 100]
     dropouts = [0.1, 0.2, 0.3]
-    lrs = [1e-3, 7e-4]          # changed from 3e-4
+    lrs = [3e-4, 7e-4, 1e-3]
     batches = [64, 128]
 
     trials: list[TrialConfig] = []
@@ -211,7 +256,7 @@ def sample_trials(
             dropout=float(rng.choice(dropouts)),
             lr=float(rng.choice(lrs)),
             batch_size=int(rng.choice(batches)),
-            seed=int(seed + len(trials)),  # deterministic per trial index
+            seed=int(seed + len(trials)),
         )
         key = (cfg.window_size, cfg.units, cfg.dropout, cfg.lr, cfg.batch_size)
         if key in seen:
@@ -220,6 +265,32 @@ def sample_trials(
         trials.append(cfg)
 
     return trials
+
+
+def get_class_weight_dict(y: np.ndarray) -> dict[int, float]:
+    classes = np.array([0, 1])
+    weights = compute_class_weight(
+        class_weight="balanced",
+        classes=classes,
+        y=y.astype(int),
+    )
+    return {0: float(weights[0]), 1: float(weights[1])}
+
+
+def collapse_penalty_from_probs(p: np.ndarray) -> float:
+    """
+    Penalize very one-sided predictions.
+    Uses predicted positive rate at 0.5 threshold.
+    """
+    pred = (p >= 0.5).astype(int)
+    pos_rate = float(pred.mean())
+
+    # no penalty in a reasonable band
+    if 0.35 <= pos_rate <= 0.65:
+        return 0.0
+
+    # moderate penalty outside band
+    return abs(pos_rate - 0.5) * 2.0
 
 
 def run_trial(
@@ -241,6 +312,8 @@ def run_trial(
 
     es = EarlyStopping(monitor="val_loss", patience=patience, restore_best_weights=True)
 
+    class_weight = get_class_weight_dict(splits["y_sub"])
+
     history = model.fit(
         splits["X_sub"],
         splits["y_sub"],
@@ -250,16 +323,26 @@ def run_trial(
         shuffle=False,
         callbacks=[es],
         verbose=verbose,
+        class_weight=class_weight,
     )
 
     p_val = model.predict(splits["X_val"], batch_size=cfg.batch_size, verbose=0).reshape(-1)
     y_val = splits["y_val"].astype(int)
 
     val_ll = float(log_loss(y_val, p_val, labels=[0, 1]))
+
     try:
         val_auc = float(roc_auc_score(y_val, p_val))
     except ValueError:
         val_auc = float("nan")
+
+    y_pred_05 = (p_val >= 0.5).astype(int)
+    val_bal_acc = float(balanced_accuracy_score(y_val, y_pred_05))
+    pred_pos_rate = float(y_pred_05.mean())
+    collapse_penalty = float(collapse_penalty_from_probs(p_val))
+
+    # lower is better
+    selection_score = val_ll + collapse_penalty
 
     return {
         "window_size": cfg.window_size,
@@ -270,25 +353,30 @@ def run_trial(
         "seed": cfg.seed,
         "val_logloss": val_ll,
         "val_auc": val_auc,
+        "val_bal_acc_05": val_bal_acc,
+        "val_pred_pos_rate_05": pred_pos_rate,
+        "collapse_penalty": collapse_penalty,
+        "selection_score": selection_score,
         "epochs_ran": len(history.history.get("loss", [])),
         "best_val_loss": float(np.min(history.history.get("val_loss", [np.inf]))),
     }
 
 
 def train_lstm_optimise(
-    symbol: str = "BTCUSD",
+    symbol: str = "BTCUSDT",
     resolution: str = "1h",
-    start_date: str = "2019-06-01",
+    start_date: str = "2017-09-01",
     end_date: str | None = None,
 
-    # Outer splits
+    horizon: int = 12,
+    vol_window: int = 24,
+
     train_ratio: float = 0.95,
     val_ratio_within_train: float = 0.10,
 
-    # Search control
-    n_trials: int = 12,
-    epochs: int = 5,
-    patience: int = 2,
+    n_trials: int = 16,
+    epochs: int = 12,
+    patience: int = 3,
 
     thresholds: tuple[float, ...] = (0.5, 0.55, 0.6),
 
@@ -304,7 +392,14 @@ def train_lstm_optimise(
     # -----------------------------
     # 1) Fetch + FE once
     # -----------------------------
-    df = fetch_and_engineer(symbol, resolution, start_date, end_date)
+    df = fetch_and_engineer(
+        symbol=symbol,
+        resolution=resolution,
+        start_date=start_date,
+        end_date=end_date,
+        horizon=horizon,
+        vol_window=vol_window,
+    )
 
     feature_cols = [
         "open", "high", "low", "close", "volume",
@@ -313,13 +408,11 @@ def train_lstm_optimise(
     ]
 
     # -----------------------------
-    # 2) Sample trial configs (no duplicates)
+    # 2) Sample trial configs
     # -----------------------------
     trials = sample_trials(n_trials=n_trials, seed=base_seed)
 
-    # Cache windowed+scaled splits per window_size
     split_cache: dict[int, dict[str, Any]] = {}
-
     all_results: list[dict[str, Any]] = []
 
     # -----------------------------
@@ -352,19 +445,25 @@ def train_lstm_optimise(
         all_results.append(res)
 
         print(
-            f"🧪 Trial {i}/{len(trials)} | win={cfg.window_size} units={cfg.units} "
-            f"drop={cfg.dropout} lr={cfg.lr} bs={cfg.batch_size} "
-            f"=> val_logloss={res['val_logloss']:.5f} "
-            f"val_auc={res['val_auc'] if not np.isnan(res['val_auc']) else 'nan'} "
-            f"(epochs_ran={res['epochs_ran']})"
+            f"🧪 Trial {i}/{len(trials)} | "
+            f"win={cfg.window_size} units={cfg.units} drop={cfg.dropout} "
+            f"lr={cfg.lr} bs={cfg.batch_size} | "
+            f"score={res['selection_score']:.5f} "
+            f"logloss={res['val_logloss']:.5f} "
+            f"bal_acc={res['val_bal_acc_05']:.4f} "
+            f"auc={res['val_auc'] if not np.isnan(res['val_auc']) else 'nan'} "
+            f"pos_rate={res['val_pred_pos_rate_05']:.3f}"
         )
 
-    results_df = pd.DataFrame(all_results).sort_values(["val_logloss", "val_auc"], ascending=[True, False])
+    results_df = pd.DataFrame(all_results).sort_values(
+        ["selection_score", "val_bal_acc_05", "val_auc"],
+        ascending=[True, False, False],
+    )
     results_df.to_csv(results_csv, index=False)
     print(f"\n✅ Saved tuning results: {results_csv}")
 
     # -----------------------------
-    # 4) Select best trial (min val_logloss)
+    # 4) Select best trial
     # -----------------------------
     best_row = results_df.iloc[0].to_dict()
     best_cfg = TrialConfig(
@@ -378,8 +477,7 @@ def train_lstm_optimise(
     print("\n🏆 Best config:", best_cfg)
 
     # -----------------------------
-    # 5) Retrain best on full train (subtrain+val), evaluate on test
-    # NOTE: No early stopping here (prevents mismatch + keeps deterministic)
+    # 5) Retrain best on full train
     # -----------------------------
     best_splits = split_cache[best_cfg.window_size]
 
@@ -393,6 +491,8 @@ def train_lstm_optimise(
         lr=best_cfg.lr,
     )
 
+    class_weight_full = get_class_weight_dict(best_splits["y_train_full"])
+
     best_model.fit(
         best_splits["X_train_full"],
         best_splits["y_train_full"],
@@ -400,16 +500,32 @@ def train_lstm_optimise(
         batch_size=best_cfg.batch_size,
         shuffle=False,
         verbose=0,
+        class_weight=class_weight_full,
     )
 
     best_model.save(best_model_path)
     print(f"✅ Saved best model: {best_model_path}")
 
-    # Test probabilities
+    # -----------------------------
+    # 6) Test probabilities
+    # -----------------------------
     p_test = best_model.predict(best_splits["X_test"], batch_size=best_cfg.batch_size, verbose=0).reshape(-1)
     y_test = best_splits["y_test"].astype(int)
+    meta_test = best_splits["meta_test"].copy()
 
-    out_df = pd.DataFrame({"y_true": y_test, "p": p_test.astype(float)})
+    out_df = pd.DataFrame({
+        "timestamp": meta_test["timestamp"].values if "timestamp" in meta_test.columns else np.arange(len(meta_test)),
+        "y_true": y_test,
+        "actual_trend": np.where(y_test == 1, "up", "down"),
+        "p_down": 1.0 - p_test,
+        "p_up": p_test.astype(float),
+        "probability": p_test.astype(float),
+        "future_close": meta_test["future_close"].values,
+        "forward_log_return": meta_test["forward_log_return"].values,
+        "sigma_t": meta_test["sigma_t"].values,
+        "sigma_h": meta_test["sigma_h"].values,
+        "target_score": meta_test["target_score"].values,
+    })
     out_df.to_csv(best_test_probs_csv, index=False)
     print(f"✅ Saved: {best_test_probs_csv}")
 
@@ -422,8 +538,14 @@ def train_lstm_optimise(
     print(f"Train UP rate: {float(best_splits['y_train_full'].mean()):.4f}")
     print(f"Test  UP rate: {float(y_test.mean()):.4f}")
 
+    print("\n📊 Test probability summary:")
+    print(pd.Series(p_test).describe())
+
+    print("\n📊 Test prediction balance @0.5:")
+    print(pd.Series((p_test >= 0.5).astype(int)).value_counts(normalize=True).sort_index())
+
     # -----------------------------
-    # 6) Save artifacts (includes scaler + params)
+    # 7) Save artifacts
     # -----------------------------
     artifacts = {
         "best_params": {
@@ -437,6 +559,8 @@ def train_lstm_optimise(
             "patience": patience,
             "train_ratio": train_ratio,
             "val_ratio_within_train": val_ratio_within_train,
+            "horizon": horizon,
+            "vol_window": vol_window,
         },
         "feature_cols": feature_cols,
         "scaler": best_splits["scaler"],
@@ -445,6 +569,9 @@ def train_lstm_optimise(
         "best_model_path": best_model_path,
         "best_test_probs_csv": best_test_probs_csv,
         "best_test_metrics_csv": best_test_metrics_csv,
+        "target_definition": (
+            "binary target: up if forward_log_return / sigma_h > 0, down otherwise"
+        ),
     }
 
     dump(artifacts, best_artifacts_path)
@@ -455,12 +582,14 @@ def train_lstm_optimise(
 
 if __name__ == "__main__":
     train_lstm_optimise(
-        symbol="BTCUSD",
+        symbol="BTCUSDT",
         resolution="1h",
-        start_date="2019-06-01",
+        start_date="2017-09-01",
         end_date=None,
-        n_trials=12,
-        epochs=8,
-        patience=2,
+        horizon=12,
+        vol_window=24,
+        n_trials=16,
+        epochs=12,
+        patience=3,
         verbose=0,
     )

@@ -1,5 +1,3 @@
-#train_eval_lstm.py
-
 import numpy as np
 import pandas as pd
 
@@ -14,11 +12,6 @@ from models.lstm.lstm import train_lstm_model
 
 
 def apply_ignore_zone(probs: np.ndarray, threshold: float):
-    """
-    Returns:
-      pred: array with {0,1} for decided samples, -1 for ignored (HOLD)
-      used_mask: boolean mask where pred != -1
-    """
     probs = np.asarray(probs, dtype=float).reshape(-1)
     pred = np.full_like(probs, fill_value=-1, dtype=np.int32)
 
@@ -136,19 +129,24 @@ def majority_baseline_with_coverage(y_true: np.ndarray, coverage: float):
 
 
 def main():
-    print("🚀 Starting Next-Direction (Train-only StandardScaler) LSTM Evaluation...\n")
+    print("🚀 Starting LSTM Evaluation with aligned XGB split...\n")
 
     model, history, probs_df, metrics_df, scaler = train_lstm_model(
         symbol="BTCUSDT",
         resolution="1h",
         start_date="2017-09-01",
         end_date=None,
+        train_ratio=0.80,  # aligned to XGB
         x_window_size=100,
         epochs=10,
         batch_size=64,
-        model_path="models/lstm/lstm.keras",
+        horizon=12,
+        vol_window=24,
+        model_path="models/lstm/lstm_vol_adj_target.keras",
         scaler_path="models/lstm/lstm_scaler.joblib",
         artifacts_path="models/lstm/lstm_artifacts.joblib",
+        preds_csv_path="models/lstm/lstm_vol_adj_target_test_probs.csv",
+        metrics_csv_path="models/lstm/lstm_vol_adj_target_metrics.csv",
     )
 
     print("\n================ TRAINING SUMMARY ================")
@@ -158,7 +156,7 @@ def main():
         print(f"Final Validation Accuracy: {history.history['val_accuracy'][-1]:.4f}")
 
     y_true = probs_df["y_true"].values.astype(int)
-    probs = probs_df["p"].values.astype(float)
+    probs = probs_df["p_up"].values.astype(float)
 
     evaluate_auc(y_true, probs)
 
