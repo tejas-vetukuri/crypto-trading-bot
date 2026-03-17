@@ -186,6 +186,9 @@ def _print_trade_block(
     print(f"Candidate setups from ensemble:  {metrics_with_fees['setups']}")
     print(f"Taken by RL:                     {metrics_with_fees['taken']}")
     print(f"Skipped by RL:                   {metrics_with_fees['skipped']}")
+    print(f"Take rate on setups:             {metrics_with_fees['take_rate']:.4f}")
+    print(f"Directional Accuracy (taken):    {metrics_with_fees['directional_accuracy']:.4f}")
+    print(f"Win Rate:                        {metrics_with_fees['win_rate']:.4f}")
     print(f"Average Gross R / trade:         {metrics_with_fees['avg_gross_r_per_trade']:.4f}")
     print(f"Average Net R / trade:           {metrics_with_fees['avg_net_r_per_trade']:.4f}")
     print(f"Total Return:                    {metrics_with_fees['total_return']:.4f}")
@@ -356,5 +359,5 @@ if __name__ == "__main__":
         ensemble_lower=0.40,
         max_horizon=3,
         min_take_visits=20,
-        q_take_margin=0.38,
+        q_take_margin=0.30,
     )
