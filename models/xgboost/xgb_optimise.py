@@ -16,7 +16,7 @@ from sklearn.metrics import (
 
 from joblib import dump
 
-from data.delta_exchange import DeltaDataClient
+from data.binance import BinanceDataClient
 from data.feature_engineering import feature_engineering_xgb
 
 
@@ -163,9 +163,9 @@ def _tune_xgb_random_search(
 
 
 def train_xgb_model(
-    symbol: str = "BTCUSD",
+    symbol: str = "BTCUSDT",
     resolution: str = "1h",
-    start_date: str = "2019-06-01",
+    start_date: str = "2017-09-01",
     end_date: str | None = None,
     train_ratio: float = 0.80,
 
@@ -183,7 +183,7 @@ def train_xgb_model(
     # -----------------------------
     # 1) Fetch candles
     # -----------------------------
-    client = DeltaDataClient()
+    client = BinanceDataClient(market="spot")
     df = client.get_candles(
         symbol=symbol,
         resolution=resolution,

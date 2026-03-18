@@ -1,7 +1,8 @@
-# xgboost.py
+from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+from pathlib import Path
 
 from xgboost import XGBClassifier
 from sklearn.preprocessing import LabelEncoder
@@ -13,38 +14,115 @@ from data.binance import BinanceDataClient
 from data.feature_engineering import feature_engineering_xgb
 
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+XGB_DIR = PROJECT_ROOT / "models" / "xgboost"
+SAVED_DIR = XGB_DIR / "saved"
+
+START_DATES_BY_INTERVAL = {
+    "5m": "2025-01-01",
+    "15m": "2024-01-01",
+    "1h": "2017-09-01",
+    "4h": "2017-09-01",
+}
+
+
+def resolve_project_path(path_str: str | Path) -> Path:
+    p = Path(path_str)
+    if p.is_absolute():
+        return p
+    return PROJECT_ROOT / p
+
+
+def get_default_start_date(resolution: str) -> str:
+    if resolution not in START_DATES_BY_INTERVAL:
+        raise ValueError(
+            f"Unsupported resolution '{resolution}'. "
+            f"Expected one of: {list(START_DATES_BY_INTERVAL.keys())}"
+        )
+    return START_DATES_BY_INTERVAL[resolution]
+
+
+def symbol_tag(symbol: str) -> str:
+    symbol = symbol.upper()
+    if symbol.endswith("USDT"):
+        return symbol[:-4]
+    return symbol
+
+
+def combo_tag(symbol: str, resolution: str) -> str:
+    return f"{symbol_tag(symbol)}_{resolution}"
+
+
+def build_xgb_save_paths(symbol: str, resolution: str) -> dict[str, Path]:
+    tag = combo_tag(symbol, resolution)
+    SAVED_DIR.mkdir(parents=True, exist_ok=True)
+
+    return {
+        "artifacts_path": SAVED_DIR / f"xgb_artifacts_{tag}.joblib",
+        "preds_csv_path": SAVED_DIR / f"xgb_predictions_{tag}.csv",
+    }
+
+
 def train_xgb_model(
     symbol: str = "BTCUSDT",
     resolution: str = "1h",
-    start_date: str = "2017-09-01",
+    start_date: str | None = None,
     end_date: str | None = None,
     train_ratio: float = 0.80,
 
     # Decision boundary (shift from 0.5 to fix skew)
-    decision_boundary: float = 0.46,
+    decision_boundary: float = 0.48,
 
     # Ignore zone around boundary
-    margin_threshold: float = 0.07,
+    margin_threshold: float = 0.1,
 
-    # Path to the tuned artifacts that contains best_params
-    tuned_artifacts_path: str = "xgb_tuned_artifacts.joblib",
+    # Leave tuned artifacts separate / unchanged
+    tuned_artifacts_path: str | Path = "models/xgboost/xgb_tuned_artifacts.joblib",
 
-    artifacts_path: str = "xgb_trend_artifacts.joblib",
-    preds_csv_path: str = "xgb_predictions.csv",
+    artifacts_path: str | Path | None = None,
+    preds_csv_path: str | Path | None = None,
 ):
     """
     XGBoost next-direction classifier with:
-      - DeltaDataClient fetch
+      - BinanceDataClient fetch
       - Feature engineering
       - Chronological split
       - Binary labels: down=0, up=1 (stable)
       - Decision boundary shift + optional ignore zone
       - Loads tuned hyperparameters from tuned_artifacts_path (best_params)
-      - Artifact saving
+      - Saves combination-specific artifacts/predictions
+
+    Save naming example for BTCUSDT, 5m:
+      - models/xgboost/saved/xgb_artifacts_BTC_5m.joblib
+      - models/xgboost/saved/xgb_predictions_BTC_5m.csv
 
     Returns:
       model, artifacts, output_df
     """
+    symbol = symbol.upper()
+    if start_date is None:
+        start_date = get_default_start_date(resolution)
+
+    default_paths = build_xgb_save_paths(symbol, resolution)
+
+    tuned_artifacts_path_p = resolve_project_path(tuned_artifacts_path)
+    artifacts_path_p = resolve_project_path(artifacts_path) if artifacts_path else default_paths["artifacts_path"]
+    preds_csv_path_p = resolve_project_path(preds_csv_path) if preds_csv_path else default_paths["preds_csv_path"]
+
+    for p in [artifacts_path_p, preds_csv_path_p]:
+        p.parent.mkdir(parents=True, exist_ok=True)
+
+    print("\n================ XGB TRAIN CONFIG ================")
+    print(f"Symbol:            {symbol}")
+    print(f"Resolution:        {resolution}")
+    print(f"Start date:        {start_date}")
+    print(f"End date:          {end_date}")
+    print(f"Train ratio:       {train_ratio}")
+    print(f"Decision boundary: {decision_boundary}")
+    print(f"Margin threshold:  {margin_threshold}")
+    print(f"Combo tag:         {combo_tag(symbol, resolution)}")
+    print(f"Tuned artifacts:   {tuned_artifacts_path_p}")
+    print("==================================================\n")
 
     # -----------------------------
     # 1) Fetch candles
@@ -58,6 +136,8 @@ def train_xgb_model(
     )
 
     df = df.sort_values("timestamp").reset_index(drop=True)
+    if df.empty:
+        raise ValueError("No candle data returned.")
 
     # -----------------------------
     # 2) Chronological split
@@ -71,7 +151,7 @@ def train_xgb_model(
     test_df = df.iloc[train_end:].copy()
 
     # -----------------------------
-    # 3) Feature engineering (separate to avoid leakage)
+    # 3) Feature engineering
     # -----------------------------
     train_df = feature_engineering_xgb(train_df)
     test_df = feature_engineering_xgb(test_df)
@@ -86,6 +166,20 @@ def train_xgb_model(
         "vol_chg_1", "vol_chg_5", "vol_z20",
     ]
 
+    missing_train = [c for c in features + ["actual_trend"] if c not in train_df.columns]
+    missing_test = [c for c in features + ["actual_trend"] if c not in test_df.columns]
+
+    if missing_train:
+        raise ValueError(f"Missing train columns after feature engineering: {missing_train}")
+    if missing_test:
+        raise ValueError(f"Missing test columns after feature engineering: {missing_test}")
+
+    train_df = train_df.dropna(subset=features + ["actual_trend"]).reset_index(drop=True)
+    test_df = test_df.dropna(subset=features + ["actual_trend"]).reset_index(drop=True)
+
+    if train_df.empty or test_df.empty:
+        raise ValueError("Empty train/test set after feature engineering and NA drop.")
+
     X_train = train_df[features]
     y_train = train_df["actual_trend"].astype(str)
 
@@ -93,35 +187,34 @@ def train_xgb_model(
     y_test = test_df["actual_trend"].astype(str)
 
     # -----------------------------
-    # 4) Encode labels (stable binary)
+    # 4) Encode labels
     # -----------------------------
     # Stable mapping for XGB: up=1, down=0
     y_train_bin = (y_train.values == "up").astype(int)
     y_test_bin = (y_test.values == "up").astype(int)
 
-    # Keep LabelEncoder just for artifacts / compatibility
     le = LabelEncoder()
     le.fit(y_train)
     if "up" not in le.classes_ or "down" not in le.classes_:
         raise ValueError(f"Expected classes to include 'up' and 'down', got {list(le.classes_)}")
 
     # -----------------------------
-    # 5) Load tuned hyperparameters (best_params)
+    # 5) Load tuned hyperparameters
     # -----------------------------
     best_params = None
     try:
-        tuned_artifacts = load(tuned_artifacts_path)
+        tuned_artifacts = load(str(tuned_artifacts_path_p))
         if isinstance(tuned_artifacts, dict) and "best_params" in tuned_artifacts:
             best_params = tuned_artifacts["best_params"]
-            print(f"✅ Loaded tuned best_params from {tuned_artifacts_path}")
+            print(f"✅ Loaded tuned best_params from {tuned_artifacts_path_p}")
         else:
-            print(f"⚠️ No 'best_params' found in {tuned_artifacts_path}. Using defaults.")
+            print(f"⚠️ No 'best_params' found in {tuned_artifacts_path_p}. Using defaults.")
     except Exception as e:
-        print(f"⚠️ Could not load tuned artifacts from {tuned_artifacts_path}: {e}")
+        print(f"⚠️ Could not load tuned artifacts from {tuned_artifacts_path_p}: {e}")
         print("⚠️ Using default XGB params.")
 
     # -----------------------------
-    # 6) Train model (binary)
+    # 6) Train model
     # -----------------------------
     default_params = dict(
         objective="binary:logistic",
@@ -135,13 +228,7 @@ def train_xgb_model(
         tree_method="hist",
     )
 
-    # Merge tuned params over defaults (tuned wins)
-    if isinstance(best_params, dict):
-        model_params = {**default_params, **best_params}
-    else:
-        model_params = default_params
-
-    # Safety: force the essentials we rely on
+    model_params = {**default_params, **best_params} if isinstance(best_params, dict) else default_params
     model_params["objective"] = "binary:logistic"
     model_params["eval_metric"] = "logloss"
 
@@ -149,7 +236,7 @@ def train_xgb_model(
     model.fit(X_train, y_train_bin)
 
     # -----------------------------
-    # 7) Predict + Decision Boundary (+ optional ignore zone)
+    # 7) Predict + decision boundary
     # -----------------------------
     if not (0.0 < decision_boundary < 1.0):
         raise ValueError(f"decision_boundary must be in (0, 1). Got {decision_boundary}")
@@ -157,12 +244,12 @@ def train_xgb_model(
     if margin_threshold < 0.0:
         raise ValueError(f"margin_threshold must be >= 0. Got {margin_threshold}")
 
-    probs = model.predict_proba(X_test)  # shape (N, 2)
-    p_up = probs[:, 1]                   # because we trained with y_train_bin where up=1
+    probs = model.predict_proba(X_test)
+    p_up = probs[:, 1]
 
     margin = np.abs(p_up - decision_boundary)
 
-    final_preds = np.full(len(p_up), 2, dtype=int)  # sideways default
+    final_preds = np.full(len(p_up), 2, dtype=int)  # 2 = sideways
     confident = margin >= margin_threshold
     final_preds[confident] = (p_up[confident] > decision_boundary).astype(int)  # 1=up, 0=down
 
@@ -173,6 +260,8 @@ def train_xgb_model(
     # -----------------------------
     output_df = pd.DataFrame({
         "timestamp": test_df["timestamp"].values,
+        "symbol": symbol,
+        "resolution": resolution,
         "prediction": final_preds,             # 0/1 or 2(sideways)
         "actual_trend": y_test.values,         # "down"/"up"
         "p_up": p_up,
@@ -182,15 +271,15 @@ def train_xgb_model(
         "probability": probability_for_pred,
     })
 
-    output_df.to_csv(preds_csv_path, index=False)
-    print(f"✅ Predictions saved to {preds_csv_path}")
+    output_df.to_csv(str(preds_csv_path_p), index=False)
+    print(f"✅ Predictions saved to {preds_csv_path_p}")
 
     # -----------------------------
-    # 9) Up/Down-only evaluation (USED trades)
+    # 9) Used-trade evaluation
     # -----------------------------
     mask = final_preds != 2
-    filtered_preds = final_preds[mask]   # 0/1
-    filtered_true = y_test_bin[mask]     # 0/1
+    filtered_preds = final_preds[mask]
+    filtered_true = y_test_bin[mask]
 
     if len(filtered_preds) > 0:
         print("\n📊 Classification Report (Up & Down only):")
@@ -212,7 +301,7 @@ def train_xgb_model(
     print(f"Test  UP rate: {float(y_test_bin.mean()):.4f}")
 
     # -----------------------------
-    # 10) Save artifacts (includes best_params used)
+    # 10) Save artifacts
     # -----------------------------
     artifacts = {
         "model": model,
@@ -221,22 +310,27 @@ def train_xgb_model(
         "decision_boundary": float(decision_boundary),
         "margin_threshold": float(margin_threshold),
         "symbol": symbol,
+        "symbol_tag": symbol_tag(symbol),
         "resolution": resolution,
+        "combo_tag": combo_tag(symbol, resolution),
         "start_date": start_date,
         "end_date": end_date,
+        "market": "spot",
+        "train_ratio": float(train_ratio),
         "ignore_zone": f"sideways if |p_up-{decision_boundary}| < {margin_threshold}",
         "best_params_used": model_params,
-        "tuned_artifacts_path": tuned_artifacts_path,
+        "tuned_artifacts_path": str(tuned_artifacts_path_p.relative_to(PROJECT_ROOT)),
+        "preds_csv_path": str(preds_csv_path_p.relative_to(PROJECT_ROOT)),
     }
 
-    dump(artifacts, artifacts_path)
-    print(f"✅ Model saved to {artifacts_path}")
+    dump(artifacts, str(artifacts_path_p))
+    print(f"✅ Model saved to {artifacts_path_p}")
 
     return model, artifacts, output_df
 
 
 if __name__ == "__main__":
-    a = load("xgb_tuned_artifacts.joblib")
+    a = load(str(resolve_project_path("models/xgboost/xgb_tuned_artifacts.joblib")))
     print(a.keys())
     print(a["best_params"])
 

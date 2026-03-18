@@ -1,4 +1,12 @@
-# frontend/app.py
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 import streamlit as st
 
 st.set_page_config(page_title="Trading Dashboard", layout="wide")
@@ -8,14 +16,14 @@ with st.sidebar:
     coin = st.selectbox(
         "Coin",
         ["BTCUSDT", "ETHUSDT"],
-        index=0,   # BTC default
+        index=0,
         key="coin"
     )
 
     interval = st.selectbox(
         "Frequency",
         ["5m", "15m", "1h", "4h"],
-        index=2,   # 1h default
+        index=2,
         key="interval"
     )
 

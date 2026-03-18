@@ -32,7 +32,7 @@ from tensorflow.keras.layers import LSTM, Dense, Dropout, Input
 from tensorflow.keras.callbacks import EarlyStopping
 from tensorflow.keras.optimizers import Adam
 
-from data.delta_exchange import DeltaDataClient
+from data.binance import BinanceDataClient
 from data.feature_engineering import feature_engineering_lstm
 from models.lstm.sequence_builder import make_windows
 from models.lstm.confidence_threshold import eval_with_ignore_zone
@@ -81,7 +81,7 @@ def fetch_and_engineer(
     start_date: str,
     end_date: str | None,
 ) -> pd.DataFrame:
-    client = DeltaDataClient()
+    client = BinanceDataClient()
     df = client.get_candles(
         symbol=symbol,
         resolution=resolution,
@@ -276,9 +276,9 @@ def run_trial(
 
 
 def train_lstm_optimise(
-    symbol: str = "BTCUSD",
+    symbol: str = "BTCUSDT",
     resolution: str = "1h",
-    start_date: str = "2019-06-01",
+    start_date: str = "2017-09-01",
     end_date: str | None = None,
 
     # Outer splits
@@ -455,9 +455,9 @@ def train_lstm_optimise(
 
 if __name__ == "__main__":
     train_lstm_optimise(
-        symbol="BTCUSD",
+        symbol="BTCUSDT",
         resolution="1h",
-        start_date="2019-06-01",
+        start_date="2017-09-01",
         end_date=None,
         n_trials=12,
         epochs=8,

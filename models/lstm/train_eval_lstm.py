@@ -1,4 +1,4 @@
-#train_eval_lstm.py
+from __future__ import annotations
 
 import numpy as np
 import pandas as pd
@@ -10,7 +10,12 @@ from sklearn.metrics import (
     roc_auc_score,
 )
 
-from models.lstm.lstm import train_lstm_model
+from models.lstm.lstm import (
+    train_lstm_model,
+    get_default_start_date,
+    combo_tag,
+    build_lstm_save_paths,
+)
 
 
 def apply_ignore_zone(probs: np.ndarray, threshold: float):
@@ -136,19 +141,35 @@ def majority_baseline_with_coverage(y_true: np.ndarray, coverage: float):
 
 
 def main():
-    print("🚀 Starting Next-Direction (Train-only StandardScaler) LSTM Evaluation...\n")
+    symbol = "BTCUSDT"
+    resolution = "1h"
+
+    start_date = get_default_start_date(resolution)
+    tag = combo_tag(symbol, resolution)
+    save_paths = build_lstm_save_paths(symbol, resolution)
+
+    print("🚀 Starting LSTM Evaluation...\n")
+    print(f"Symbol:      {symbol}")
+    print(f"Resolution:  {resolution}")
+    print(f"Start date:  {start_date}")
+    print(f"Combo tag:   {tag}")
+    print(f"Model path:  {save_paths['model_path']}")
+    print()
 
     model, history, probs_df, metrics_df, scaler = train_lstm_model(
-        symbol="BTCUSDT",
-        resolution="1h",
-        start_date="2017-09-01",
+        symbol=symbol,
+        resolution=resolution,
+        start_date=start_date,
         end_date=None,
         x_window_size=100,
         epochs=10,
         batch_size=64,
-        model_path="models/lstm/lstm.keras",
-        scaler_path="models/lstm/lstm_scaler.joblib",
-        artifacts_path="models/lstm/lstm_artifacts.joblib",
+        model_path=save_paths["model_path"],
+        scaler_path=save_paths["scaler_path"],
+        artifacts_path=save_paths["artifacts_path"],
+        test_probs_path=save_paths["test_probs_path"],
+        metrics_path=save_paths["metrics_path"],
+        thresholds=(0.50, 0.51, 0.52, 0.53, 0.54, 0.55, 0.56, 0.57, 0.58),
     )
 
     print("\n================ TRAINING SUMMARY ================")
@@ -163,7 +184,7 @@ def main():
     evaluate_auc(y_true, probs)
 
     print("\n📊 ================= THRESHOLDS + BASELINES =================")
-    for t in [0.5, 0.51, 0.52, 0.53, 0.54, 0.55, 0.56, 0.57, 0.58]:
+    for t in [0.50, 0.51, 0.52, 0.53, 0.54, 0.55, 0.56, 0.57, 0.58]:
         print("\n" + "=" * 55)
 
         coverage = evaluate_threshold(y_true, probs, threshold=t)
@@ -180,6 +201,7 @@ def main():
     print(f"\nTotal test samples: {len(probs_df)}")
 
     print("\n✅ Full evaluation completed successfully")
+    print(f"✅ Saved combination files for: {tag}")
 
 
 if __name__ == "__main__":

@@ -1,8 +1,7 @@
-#eval_rl.py
-
 from __future__ import annotations
 
 from dataclasses import replace
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -10,6 +9,7 @@ import pandas as pd
 from data.binance import BinanceDataClient
 
 from models.rl.rl_ensemble import (
+    PROJECT_ROOT,
     QTableAgent,
     RiskConfig,
     build_merged_dataset,
@@ -18,7 +18,19 @@ from models.rl.rl_ensemble import (
     _compute_atr_pct,
     simulate_trade_outcome,
     choose_action_with_margin,
+    get_default_start_date,
+    combo_tag,
+    resolve_artifact_path,
 )
+
+
+def _build_eval_combo_paths(symbol: str, resolution: str) -> dict[str, Path]:
+    tag = combo_tag(symbol, resolution)
+    return {
+        "xgb_artifacts_path": PROJECT_ROOT / "models" / "xgboost" / "saved" / f"xgb_artifacts_{tag}.joblib",
+        "lstm_artifacts_path": PROJECT_ROOT / "models" / "lstm" / "saved" / f"lstm_artifacts_{tag}.joblib",
+        "rl_agent_path": PROJECT_ROOT / "models" / "rl" / "saved" / f"rl_qtable_agent_{tag}.joblib",
+    }
 
 
 def _safe_mean(x):
@@ -212,13 +224,13 @@ def _print_trade_block(
 def evaluate_rl_agent(
     symbol: str = "BTCUSDT",
     resolution: str = "1h",
-    start_date: str = "2017-09-01",
+    start_date: str | None = None,
     end_date: str | None = None,
     train_ratio: float = 0.80,
-    xgb_artifacts_path: str = "models/xgboost/xgb_trend_artifacts.joblib",
-    lstm_artifacts_path: str = "models/lstm/lstm_artifacts.joblib",
+    xgb_artifacts_path: str | Path | None = None,
+    lstm_artifacts_path: str | Path | None = None,
     lstm_threshold: float = 0.52,
-    rl_agent_path: str = "models/rl/rl_qtable_agent.joblib",
+    rl_agent_path: str | Path | None = None,
     risk: RiskConfig = RiskConfig(),
     ensemble_weight_xgb: float = 0.8,
     ensemble_weight_lstm: float = 0.2,
@@ -228,7 +240,41 @@ def evaluate_rl_agent(
     min_take_visits: int = 20,
     q_take_margin: float = 0.0,
 ):
-    agent = QTableAgent.load(rl_agent_path)
+    symbol = symbol.upper()
+    if start_date is None:
+        start_date = get_default_start_date(resolution)
+
+    combo_paths = _build_eval_combo_paths(symbol, resolution)
+
+    xgb_artifacts_path_p = (
+        Path(resolve_artifact_path(xgb_artifacts_path))
+        if xgb_artifacts_path
+        else combo_paths["xgb_artifacts_path"]
+    )
+    lstm_artifacts_path_p = (
+        Path(resolve_artifact_path(lstm_artifacts_path))
+        if lstm_artifacts_path
+        else combo_paths["lstm_artifacts_path"]
+    )
+    rl_agent_path_p = (
+        Path(resolve_artifact_path(rl_agent_path))
+        if rl_agent_path
+        else combo_paths["rl_agent_path"]
+    )
+
+    print("\n================ RL EVAL CONFIG ================")
+    print(f"Symbol:             {symbol}")
+    print(f"Resolution:         {resolution}")
+    print(f"Start date:         {start_date}")
+    print(f"End date:           {end_date}")
+    print(f"Train ratio:        {train_ratio}")
+    print(f"Combo tag:          {combo_tag(symbol, resolution)}")
+    print(f"XGB artifacts:      {xgb_artifacts_path_p}")
+    print(f"LSTM artifacts:     {lstm_artifacts_path_p}")
+    print(f"RL agent:           {rl_agent_path_p}")
+    print("================================================\n")
+
+    agent = QTableAgent.load(rl_agent_path_p)
 
     client = BinanceDataClient(market="spot")
     df_raw = client.get_candles(
@@ -247,8 +293,8 @@ def evaluate_rl_agent(
 
     merged = build_merged_dataset(
         df_raw=test_raw,
-        xgb_artifacts_path=xgb_artifacts_path,
-        lstm_artifacts_path=lstm_artifacts_path,
+        xgb_artifacts_path=xgb_artifacts_path_p,
+        lstm_artifacts_path=lstm_artifacts_path_p,
         lstm_threshold=lstm_threshold,
     )
 
@@ -359,5 +405,5 @@ if __name__ == "__main__":
         ensemble_lower=0.40,
         max_horizon=3,
         min_take_visits=20,
-        q_take_margin=0.30,
+        q_take_margin=0.20,
     )

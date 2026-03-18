@@ -1,8 +1,8 @@
-# models/lstm/lstm.py
+from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-from pathlib import Path  # ✅ NEW
+from pathlib import Path
 
 from sklearn.preprocessing import StandardScaler
 from tensorflow.keras.models import Sequential
@@ -10,7 +10,7 @@ from tensorflow.keras.layers import LSTM, Dense, Dropout, Input
 from tensorflow.keras.callbacks import EarlyStopping
 from tensorflow.keras.optimizers import Adam
 
-from joblib import dump  # ✅
+from joblib import dump
 
 from data.binance import BinanceDataClient
 from data.feature_engineering import feature_engineering_lstm
@@ -18,49 +18,119 @@ from models.lstm.sequence_builder import make_windows
 from models.lstm.confidence_threshold import eval_with_ignore_zone
 
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+LSTM_DIR = PROJECT_ROOT / "models" / "lstm"
+SAVED_DIR = LSTM_DIR / "saved"
+
+START_DATES_BY_INTERVAL = {
+    "5m": "2025-01-01",
+    "15m": "2024-01-01",
+    "1h": "2017-09-01",
+    "4h": "2017-09-01",
+}
+
+
+def resolve_project_path(path_str: str | Path) -> Path:
+    p = Path(path_str)
+    if p.is_absolute():
+        return p
+    return PROJECT_ROOT / p
+
+
+def get_default_start_date(resolution: str) -> str:
+    if resolution not in START_DATES_BY_INTERVAL:
+        raise ValueError(
+            f"Unsupported resolution '{resolution}'. "
+            f"Expected one of: {list(START_DATES_BY_INTERVAL.keys())}"
+        )
+    return START_DATES_BY_INTERVAL[resolution]
+
+
+def symbol_tag(symbol: str) -> str:
+    symbol = symbol.upper()
+    if symbol.endswith("USDT"):
+        return symbol[:-4]
+    return symbol
+
+
+def combo_tag(symbol: str, resolution: str) -> str:
+    return f"{symbol_tag(symbol)}_{resolution}"
+
+
+def build_lstm_save_paths(symbol: str, resolution: str) -> dict[str, Path]:
+    tag = combo_tag(symbol, resolution)
+    SAVED_DIR.mkdir(parents=True, exist_ok=True)
+
+    return {
+        "model_path": SAVED_DIR / f"lstm_{tag}.keras",
+        "scaler_path": SAVED_DIR / f"lstm_scaler_{tag}.joblib",
+        "artifacts_path": SAVED_DIR / f"lstm_artifacts_{tag}.joblib",
+        "test_probs_path": SAVED_DIR / f"lstm_test_probs_{tag}.csv",
+        "metrics_path": SAVED_DIR / f"lstm_metrics_{tag}.csv",
+    }
+
+
 def train_lstm_model(
     symbol: str = "BTCUSDT",
     resolution: str = "1h",
-    start_date: str = "2017-09-01",
+    start_date: str | None = None,
     end_date: str | None = None,
     x_window_size: int = 100,
     epochs: int = 10,
     batch_size: int = 64,
-
-    # ✅ defaults match your folder structure
-    model_path: str = "models/lstm/lstm_next_direction_stdscale.keras",
-    scaler_path: str = "models/lstm/lstm_scaler.joblib",
-    artifacts_path: str = "models/lstm/lstm_artifacts.joblib",
-
-    thresholds: tuple[float, ...] = (0.5, 0.55, 0.6),
+    model_path: str | Path | None = None,
+    scaler_path: str | Path | None = None,
+    artifacts_path: str | Path | None = None,
+    test_probs_path: str | Path | None = None,
+    metrics_path: str | Path | None = None,
+    thresholds: tuple[float, ...] = (0.50, 0.52, 0.55, 0.60),
 ):
     """
-    Next-candle direction LSTM with:
-      - feature_engineering_lstm(df)
-      - RAW windows via make_windows(df, x_window_size, feature_cols)
-      - train-only StandardScaler (fit on train windows across all timesteps)
-      - LSTM(100) + Dropout(0.2) + Dense(sigmoid)
-      - chronological 95/5 split
-      - optional ignore-zone metrics at given thresholds
+    Trains next-candle direction LSTM and saves combination-specific outputs.
 
-    Saves:
-      - model_path (.keras)
-      - scaler_path (.joblib)
-      - artifacts_path (.joblib) for RL auto-detect
+    Save naming example for BTCUSDT, 5m:
+      - models/lstm/saved/lstm_BTC_5m.keras
+      - models/lstm/saved/lstm_scaler_BTC_5m.joblib
+      - models/lstm/saved/lstm_artifacts_BTC_5m.joblib
+      - models/lstm/saved/lstm_test_probs_BTC_5m.csv
+      - models/lstm/saved/lstm_metrics_BTC_5m.csv
 
     Returns:
-      model, history, out_df (y_true + prob), metrics_df, scaler
+      model, history, out_df, metrics_df, scaler
     """
+    symbol = symbol.upper()
+    if start_date is None:
+        start_date = get_default_start_date(resolution)
 
-    # -----------------------------
+    default_paths = build_lstm_save_paths(symbol, resolution)
+
+    model_path_p = resolve_project_path(model_path) if model_path else default_paths["model_path"]
+    scaler_path_p = resolve_project_path(scaler_path) if scaler_path else default_paths["scaler_path"]
+    artifacts_path_p = resolve_project_path(artifacts_path) if artifacts_path else default_paths["artifacts_path"]
+    test_probs_path_p = resolve_project_path(test_probs_path) if test_probs_path else default_paths["test_probs_path"]
+    metrics_path_p = resolve_project_path(metrics_path) if metrics_path else default_paths["metrics_path"]
+
+    for p in [model_path_p, scaler_path_p, artifacts_path_p, test_probs_path_p, metrics_path_p]:
+        p.parent.mkdir(parents=True, exist_ok=True)
+
+    print("\n================ LSTM TRAIN CONFIG ================")
+    print(f"Symbol:        {symbol}")
+    print(f"Resolution:    {resolution}")
+    print(f"Start date:    {start_date}")
+    print(f"End date:      {end_date}")
+    print(f"Window size:   {x_window_size}")
+    print(f"Epochs:        {epochs}")
+    print(f"Batch size:    {batch_size}")
+    print(f"Combo tag:     {combo_tag(symbol, resolution)}")
+    print("===================================================\n")
+
     # 1) Fetch candles
-    # -----------------------------
     client = BinanceDataClient(market="spot")
     df = client.get_candles(
         symbol=symbol,
         resolution=resolution,
         start_date=start_date,
-        end_date=end_date
+        end_date=end_date,
     )
 
     required = {"open", "high", "low", "close", "volume"}
@@ -69,10 +139,10 @@ def train_lstm_model(
         raise ValueError(f"Missing required columns: {missing}")
 
     df = df.dropna(subset=list(required)).reset_index(drop=True)
+    if df.empty:
+        raise ValueError("No rows returned after raw candle cleaning.")
 
-    # -----------------------------
     # 2) Feature engineering
-    # -----------------------------
     df = feature_engineering_lstm(df)
 
     feature_cols = [
@@ -82,9 +152,10 @@ def train_lstm_model(
     ]
     df = df.dropna(subset=feature_cols).reset_index(drop=True)
 
-    # -----------------------------
-    # 3) Windowing + label
-    # -----------------------------
+    if df.empty:
+        raise ValueError("No rows available after feature engineering and NA drop.")
+
+    # 3) Windowing + labels
     X, y = make_windows(df, x_window_size=x_window_size, feature_cols=feature_cols)
     X = np.asarray(X, dtype=np.float32)
     y = np.asarray(y, dtype=np.int32)
@@ -96,9 +167,7 @@ def train_lstm_model(
     if X.shape[2] != len(feature_cols):
         raise ValueError(f"Expected F={len(feature_cols)}, got {X.shape[2]}")
 
-    # -----------------------------
-    # 4) Chronological split (95/5)
-    # -----------------------------
+    # 4) Chronological split
     n = len(X)
     train_end = int(n * 0.95)
     if train_end <= 0 or train_end >= n:
@@ -107,27 +176,20 @@ def train_lstm_model(
     X_train, X_test = X[:train_end], X[train_end:]
     y_train, y_test = y[:train_end], y[train_end:]
 
-    # -----------------------------
     # 5) Train-only StandardScaler
-    # -----------------------------
     n_features = X_train.shape[-1]
     scaler = StandardScaler()
 
     X_train_2d = X_train.reshape(-1, n_features)
     scaler.fit(X_train_2d)
 
-    # ✅ ensure directory exists before saving
-    scaler_path_p = Path(scaler_path)
-    scaler_path_p.parent.mkdir(parents=True, exist_ok=True)
     dump(scaler, str(scaler_path_p))
-    print(f"✅ Saved: {scaler_path_p}")
+    print(f"✅ Saved scaler: {scaler_path_p}")
 
     X_train_s = scaler.transform(X_train_2d).reshape(X_train.shape).astype(np.float32)
     X_test_s = scaler.transform(X_test.reshape(-1, n_features)).reshape(X_test.shape).astype(np.float32)
 
-    # -----------------------------
     # 6) Model
-    # -----------------------------
     model = Sequential([
         Input(shape=(x_window_size, n_features)),
         LSTM(100, return_sequences=False),
@@ -138,60 +200,65 @@ def train_lstm_model(
     model.compile(
         optimizer=Adam(learning_rate=0.001),
         loss="binary_crossentropy",
-        metrics=["accuracy"]
+        metrics=["accuracy"],
     )
 
     history = model.fit(
-        X_train_s, y_train,
+        X_train_s,
+        y_train,
         epochs=epochs,
         batch_size=batch_size,
         validation_split=0.05,
         shuffle=False,
         callbacks=[EarlyStopping(patience=3, restore_best_weights=True)],
-        verbose=1
+        verbose=1,
     )
 
-    # ✅ ensure directory exists before saving model
-    model_path_p = Path(model_path)
-    model_path_p.parent.mkdir(parents=True, exist_ok=True)
     model.save(str(model_path_p))
-    print(f"✅ Saved: {model_path_p}")
+    print(f"✅ Saved model: {model_path_p}")
 
-    # -----------------------------
     # 7) Test probs + metrics
-    # -----------------------------
-    p_test = model.predict(X_test_s, batch_size=batch_size).reshape(-1)
+    p_test = model.predict(X_test_s, batch_size=batch_size, verbose=0).reshape(-1)
 
-    out_df = pd.DataFrame({"y_true": y_test.astype(int), "p": p_test.astype(float)})
-    out_df.to_csv("lstm_next_direction_stdscale_test_probs.csv", index=False)
+    out_df = pd.DataFrame({
+        "symbol": symbol,
+        "resolution": resolution,
+        "y_true": y_test.astype(int),
+        "p": p_test.astype(float),
+    })
+    out_df.to_csv(str(test_probs_path_p), index=False)
+    print(f"✅ Saved test probs: {test_probs_path_p}")
 
     metrics = [eval_with_ignore_zone(y_test, p_test, threshold=t) for t in thresholds]
     metrics_df = pd.DataFrame(metrics)
-    metrics_df.to_csv("lstm_next_direction_stdscale_metrics.csv", index=False)
+    metrics_df.insert(0, "symbol", symbol)
+    metrics_df.insert(1, "resolution", resolution)
+    metrics_df.to_csv(str(metrics_path_p), index=False)
+    print(f"✅ Saved metrics: {metrics_path_p}")
 
-    # -----------------------------
-    # 8) ✅ Save LSTM artifacts for RL auto-detect
-    # -----------------------------
+    # 8) Save artifacts
     lstm_artifacts = {
-        "model_path": str(model_path_p),
-        "scaler_path": str(scaler_path_p),
+        "model_path": str(model_path_p.relative_to(PROJECT_ROOT)),
+        "scaler_path": str(scaler_path_p.relative_to(PROJECT_ROOT)),
+        "test_probs_path": str(test_probs_path_p.relative_to(PROJECT_ROOT)),
+        "metrics_path": str(metrics_path_p.relative_to(PROJECT_ROOT)),
         "x_window_size": int(x_window_size),
         "feature_cols": feature_cols,
         "symbol": symbol,
+        "symbol_tag": symbol_tag(symbol),
         "resolution": resolution,
+        "combo_tag": combo_tag(symbol, resolution),
         "start_date": start_date,
         "end_date": end_date,
-        "thresholds_eval": thresholds,
-        "ignore_zone_threshold_for_sideways": 0.52,
+        "thresholds_eval": tuple(float(t) for t in thresholds),
+        "ignore_zone_threshold_for_sideways": 0.53,
+        "market": "spot",
+        "train_split_ratio": 0.95,
     }
 
-    artifacts_path_p = Path(artifacts_path)
-    artifacts_path_p.parent.mkdir(parents=True, exist_ok=True)
     dump(lstm_artifacts, str(artifacts_path_p))
-    print(f"✅ Saved: {artifacts_path_p}")
+    print(f"✅ Saved artifacts: {artifacts_path_p}")
 
-    print("✅ Saved: lstm_next_direction_stdscale_test_probs.csv")
-    print("✅ Saved: lstm_next_direction_stdscale_metrics.csv")
     print("\n📊 Label balance:")
     print(f"Train UP rate: {float(y_train.mean()):.4f}")
     print(f"Test  UP rate: {float(y_test.mean()):.4f}")

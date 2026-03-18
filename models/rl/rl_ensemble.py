@@ -1,5 +1,3 @@
-#rl_ensemble.py
-
 from __future__ import annotations
 
 import math
@@ -24,13 +22,53 @@ from models.lstm.sequence_builder import make_windows
 # -----------------------------
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+RL_DIR = PROJECT_ROOT / "models" / "rl"
+RL_SAVED_DIR = RL_DIR / "saved"
+
+START_DATES_BY_INTERVAL = {
+    "5m": "2025-01-01",
+    "15m": "2024-01-01",
+    "1h": "2017-09-01",
+    "4h": "2017-09-01",
+}
 
 
-def resolve_artifact_path(path_like: str) -> str:
+def resolve_artifact_path(path_like: str | Path) -> str:
     p = Path(path_like)
     if p.is_absolute():
         return str(p)
     return str((PROJECT_ROOT / p).resolve())
+
+
+def get_default_start_date(resolution: str) -> str:
+    if resolution not in START_DATES_BY_INTERVAL:
+        raise ValueError(
+            f"Unsupported resolution '{resolution}'. "
+            f"Expected one of: {list(START_DATES_BY_INTERVAL.keys())}"
+        )
+    return START_DATES_BY_INTERVAL[resolution]
+
+
+def symbol_tag(symbol: str) -> str:
+    symbol = symbol.upper()
+    if symbol.endswith("USDT"):
+        return symbol[:-4]
+    return symbol
+
+
+def combo_tag(symbol: str, resolution: str) -> str:
+    return f"{symbol_tag(symbol)}_{resolution}"
+
+
+def build_combo_artifact_paths(symbol: str, resolution: str) -> dict[str, Path]:
+    tag = combo_tag(symbol, resolution)
+    RL_SAVED_DIR.mkdir(parents=True, exist_ok=True)
+
+    return {
+        "xgb_artifacts_path": PROJECT_ROOT / "models" / "xgboost" / "saved" / f"xgb_artifacts_{tag}.joblib",
+        "lstm_artifacts_path": PROJECT_ROOT / "models" / "lstm" / "saved" / f"lstm_artifacts_{tag}.joblib",
+        "rl_agent_path": RL_SAVED_DIR / f"rl_qtable_agent_{tag}.joblib",
+    }
 
 
 # -----------------------------
@@ -127,7 +165,7 @@ class QTableAgent:
     def decay_eps(self):
         self.eps = max(self.eps_min, self.eps * self.eps_decay)
 
-    def save(self, path: str):
+    def save(self, path: str | Path):
         dump(
             {
                 "Q": self.Q,
@@ -146,7 +184,7 @@ class QTableAgent:
         )
 
     @staticmethod
-    def load(path: str) -> "QTableAgent":
+    def load(path: str | Path) -> "QTableAgent":
         obj = load(resolve_artifact_path(path))
         Q = obj["Q"]
         visits = obj.get("visits", np.zeros_like(Q, dtype=np.int32))
@@ -216,7 +254,7 @@ def choose_action_with_margin(
 
 def predict_xgb_series(
     df_raw: pd.DataFrame,
-    xgb_artifacts_path: str,
+    xgb_artifacts_path: str | Path,
 ) -> pd.DataFrame:
     artifacts = load(resolve_artifact_path(xgb_artifacts_path))
     model = artifacts["model"]
@@ -259,7 +297,7 @@ def predict_xgb_series(
 
 def predict_lstm_series(
     df_raw: pd.DataFrame,
-    lstm_artifacts_path: str = "models/lstm/lstm_artifacts.joblib",
+    lstm_artifacts_path: str | Path,
     threshold: float = 0.52,
     batch_size: int = 256,
 ) -> pd.DataFrame:
@@ -369,7 +407,7 @@ def build_filter_state_index(
     return int(idx)
 
 
-N_STATES = 4 * 4 * 3 * 2 * 2  # 192
+N_STATES = 4 * 4 * 3 * 2 * 2
 
 
 # -----------------------------
@@ -585,8 +623,8 @@ def reward_for_action(
 
 def build_merged_dataset(
     df_raw: pd.DataFrame,
-    xgb_artifacts_path: str,
-    lstm_artifacts_path: str,
+    xgb_artifacts_path: str | Path,
+    lstm_artifacts_path: str | Path,
     lstm_threshold: float,
 ) -> pd.DataFrame:
     xgb_df = predict_xgb_series(df_raw, xgb_artifacts_path=xgb_artifacts_path)
@@ -707,13 +745,13 @@ def _next_state_from_index(
 def train_rl_policy(
     symbol: str = "BTCUSDT",
     resolution: str = "1h",
-    start_date: str = "2017-09-01",
+    start_date: str | None = None,
     end_date: str | None = None,
     train_ratio: float = 0.80,
-    xgb_artifacts_path: str = "models/xgboost/xgb_trend_artifacts.joblib",
-    lstm_artifacts_path: str = "models/lstm/lstm_artifacts.joblib",
+    xgb_artifacts_path: str | Path | None = None,
+    lstm_artifacts_path: str | Path | None = None,
     lstm_threshold: float = 0.52,
-    agent_out_path: str = "models/rl/rl_qtable_agent.joblib",
+    agent_out_path: str | Path | None = None,
     alpha: float = 0.20,
     gamma: float = 0.95,
     eps: float = 0.25,
@@ -726,6 +764,42 @@ def train_rl_policy(
     max_horizon: int = 3,
     skip_reward_scale: float = 0.15,
 ) -> QTableAgent:
+    symbol = symbol.upper()
+    if start_date is None:
+        start_date = get_default_start_date(resolution)
+
+    combo_paths = build_combo_artifact_paths(symbol, resolution)
+
+    xgb_artifacts_path_p = (
+        Path(resolve_artifact_path(xgb_artifacts_path))
+        if xgb_artifacts_path
+        else combo_paths["xgb_artifacts_path"]
+    )
+    lstm_artifacts_path_p = (
+        Path(resolve_artifact_path(lstm_artifacts_path))
+        if lstm_artifacts_path
+        else combo_paths["lstm_artifacts_path"]
+    )
+    agent_out_path_p = (
+        Path(resolve_artifact_path(agent_out_path))
+        if agent_out_path
+        else combo_paths["rl_agent_path"]
+    )
+
+    agent_out_path_p.parent.mkdir(parents=True, exist_ok=True)
+
+    print("\n================ RL TRAIN CONFIG ================")
+    print(f"Symbol:             {symbol}")
+    print(f"Resolution:         {resolution}")
+    print(f"Start date:         {start_date}")
+    print(f"End date:           {end_date}")
+    print(f"Train ratio:        {train_ratio}")
+    print(f"Combo tag:          {combo_tag(symbol, resolution)}")
+    print(f"XGB artifacts:      {xgb_artifacts_path_p}")
+    print(f"LSTM artifacts:     {lstm_artifacts_path_p}")
+    print(f"RL agent out:       {agent_out_path_p}")
+    print("=================================================\n")
+
     client = BinanceDataClient(market="spot")
     df_raw = client.get_candles(
         symbol=symbol,
@@ -743,8 +817,8 @@ def train_rl_policy(
 
     merged = build_merged_dataset(
         df_raw=train_raw,
-        xgb_artifacts_path=xgb_artifacts_path,
-        lstm_artifacts_path=lstm_artifacts_path,
+        xgb_artifacts_path=xgb_artifacts_path_p,
+        lstm_artifacts_path=lstm_artifacts_path_p,
         lstm_threshold=lstm_threshold,
     )
 
@@ -816,11 +890,12 @@ def train_rl_policy(
         agent.decay_eps()
         print(
             f"Episode {ep + 1}/{episodes} complete | "
-            f"eps={agent.eps:.4f} | setups={setups} | taken={taken} | skipped={skipped} | total_R={total_reward_r:.2f}"
+            f"eps={agent.eps:.4f} | setups={setups} | taken={taken} | "
+            f"skipped={skipped} | total_R={total_reward_r:.2f}"
         )
 
-    agent.save(agent_out_path)
-    print(f"✅ Saved RL agent to {resolve_artifact_path(agent_out_path)}")
+    agent.save(agent_out_path_p)
+    print(f"✅ Saved RL agent to {resolve_artifact_path(agent_out_path_p)}")
     return agent
 
 
@@ -831,12 +906,12 @@ def train_rl_policy(
 def get_trade_signal_rl(
     symbol: str = "BTCUSDT",
     resolution: str = "1h",
-    start_date: str = "2017-09-01",
+    start_date: str | None = None,
     end_date: str | None = None,
-    xgb_artifacts_path: str = "models/xgboost/xgb_trend_artifacts.joblib",
-    lstm_artifacts_path: str = "models/lstm/lstm_artifacts.joblib",
+    xgb_artifacts_path: str | Path | None = None,
+    lstm_artifacts_path: str | Path | None = None,
     lstm_threshold: float = 0.52,
-    rl_agent_path: str = "models/rl/rl_qtable_agent.joblib",
+    rl_agent_path: str | Path | None = None,
     risk: RiskConfig = RiskConfig(),
     ensemble_weight_xgb: float = 0.8,
     ensemble_weight_lstm: float = 0.2,
@@ -845,7 +920,29 @@ def get_trade_signal_rl(
     min_take_visits: int = 20,
     q_take_margin: float = 0.0,
 ) -> TradeSignal:
-    agent = QTableAgent.load(rl_agent_path)
+    symbol = symbol.upper()
+    if start_date is None:
+        start_date = get_default_start_date(resolution)
+
+    combo_paths = build_combo_artifact_paths(symbol, resolution)
+
+    xgb_artifacts_path_p = (
+        Path(resolve_artifact_path(xgb_artifacts_path))
+        if xgb_artifacts_path
+        else combo_paths["xgb_artifacts_path"]
+    )
+    lstm_artifacts_path_p = (
+        Path(resolve_artifact_path(lstm_artifacts_path))
+        if lstm_artifacts_path
+        else combo_paths["lstm_artifacts_path"]
+    )
+    rl_agent_path_p = (
+        Path(resolve_artifact_path(rl_agent_path))
+        if rl_agent_path
+        else combo_paths["rl_agent_path"]
+    )
+
+    agent = QTableAgent.load(rl_agent_path_p)
 
     client = BinanceDataClient(market="spot")
     df_raw = client.get_candles(
@@ -857,8 +954,8 @@ def get_trade_signal_rl(
 
     merged = build_merged_dataset(
         df_raw=df_raw,
-        xgb_artifacts_path=xgb_artifacts_path,
-        lstm_artifacts_path=lstm_artifacts_path,
+        xgb_artifacts_path=xgb_artifacts_path_p,
+        lstm_artifacts_path=lstm_artifacts_path_p,
         lstm_threshold=lstm_threshold,
     )
 
@@ -894,7 +991,11 @@ def get_trade_signal_rl(
             meta={
                 "symbol": symbol,
                 "resolution": resolution,
+                "combo_tag": combo_tag(symbol, resolution),
                 "timestamp": str(last["timestamp"]),
+                "xgb_artifacts_path": str(xgb_artifacts_path_p),
+                "lstm_artifacts_path": str(lstm_artifacts_path_p),
+                "rl_agent_path": str(rl_agent_path_p),
                 "xgb_p_up": float(last["xgb_p_up"]),
                 "lstm_p_up": float(last["lstm_p_up"]),
                 "ensemble_p_up": float(p_ens),
@@ -951,7 +1052,11 @@ def get_trade_signal_rl(
             meta={
                 "symbol": symbol,
                 "resolution": resolution,
+                "combo_tag": combo_tag(symbol, resolution),
                 "timestamp": str(last["timestamp"]),
+                "xgb_artifacts_path": str(xgb_artifacts_path_p),
+                "lstm_artifacts_path": str(lstm_artifacts_path_p),
+                "rl_agent_path": str(rl_agent_path_p),
                 "xgb_p_up": float(last["xgb_p_up"]),
                 "lstm_p_up": float(last["lstm_p_up"]),
                 "ensemble_p_up": float(p_ens),
@@ -999,7 +1104,11 @@ def get_trade_signal_rl(
         meta={
             "symbol": symbol,
             "resolution": resolution,
+            "combo_tag": combo_tag(symbol, resolution),
             "timestamp": str(last["timestamp"]),
+            "xgb_artifacts_path": str(xgb_artifacts_path_p),
+            "lstm_artifacts_path": str(lstm_artifacts_path_p),
+            "rl_agent_path": str(rl_agent_path_p),
             "xgb_p_up": float(last["xgb_p_up"]),
             "lstm_p_up": float(last["lstm_p_up"]),
             "ensemble_p_up": float(p_ens),

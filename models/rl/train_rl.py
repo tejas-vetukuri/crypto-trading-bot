@@ -1,19 +1,13 @@
-#train_rl.py
-
 from models.rl.rl_ensemble import train_rl_policy, RiskConfig
 
 
 if __name__ == "__main__":
     train_rl_policy(
         symbol="BTCUSDT",
-        resolution="1h",
-        start_date="2017-06-01",
+        resolution="4h",
         end_date=None,
         train_ratio=0.80,
-        xgb_artifacts_path="models/xgboost/xgb_trend_artifacts.joblib",
-        lstm_artifacts_path="models/lstm/lstm_artifacts.joblib",
-        lstm_threshold=0.52,
-        agent_out_path="models/rl/rl_qtable_agent.joblib",
+        lstm_threshold=0.53,
         alpha=0.20,
         gamma=0.95,
         eps=0.25,
