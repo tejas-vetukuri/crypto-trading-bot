@@ -78,6 +78,12 @@ def train_lstm_model(
     x_window_size: int = 100,
     epochs: int = 10,
     batch_size: int = 64,
+    train_ratio: float = 0.80,
+    validation_split: float = 0.05,
+    learning_rate: float = 0.001,
+    lstm_units: int = 100,
+    dropout_rate: float = 0.20,
+    early_stopping_patience: int = 3,
     model_path: str | Path | None = None,
     scaler_path: str | Path | None = None,
     artifacts_path: str | Path | None = None,
@@ -87,6 +93,15 @@ def train_lstm_model(
 ):
     """
     Trains next-candle direction LSTM and saves combination-specific outputs.
+
+    Split logic:
+      - chronological train/test split using train_ratio
+      - validation_split is taken only from the training block inside model.fit()
+
+    Default effective split:
+      - 80% train block
+      - 5% of that 80% used as validation
+      - 20% held-out test
 
     Save naming example for BTCUSDT, 5m:
       - models/lstm/saved/lstm_BTC_5m.keras
@@ -102,6 +117,31 @@ def train_lstm_model(
     if start_date is None:
         start_date = get_default_start_date(resolution)
 
+    if not (0.0 < train_ratio < 1.0):
+        raise ValueError(f"train_ratio must be in (0, 1). Got {train_ratio}")
+
+    if not (0.0 < validation_split < 1.0):
+        raise ValueError(f"validation_split must be in (0, 1). Got {validation_split}")
+
+    if validation_split >= train_ratio:
+        raise ValueError(
+            f"validation_split ({validation_split}) should be smaller than train_ratio ({train_ratio})."
+        )
+
+    if learning_rate <= 0:
+        raise ValueError(f"learning_rate must be > 0. Got {learning_rate}")
+
+    if lstm_units <= 0:
+        raise ValueError(f"lstm_units must be > 0. Got {lstm_units}")
+
+    if not (0.0 <= dropout_rate < 1.0):
+        raise ValueError(f"dropout_rate must be in [0, 1). Got {dropout_rate}")
+
+    if early_stopping_patience < 1:
+        raise ValueError(
+            f"early_stopping_patience must be >= 1. Got {early_stopping_patience}"
+        )
+
     default_paths = build_lstm_save_paths(symbol, resolution)
 
     model_path_p = resolve_project_path(model_path) if model_path else default_paths["model_path"]
@@ -114,17 +154,22 @@ def train_lstm_model(
         p.parent.mkdir(parents=True, exist_ok=True)
 
     print("\n================ LSTM TRAIN CONFIG ================")
-    print(f"Symbol:        {symbol}")
-    print(f"Resolution:    {resolution}")
-    print(f"Start date:    {start_date}")
-    print(f"End date:      {end_date}")
-    print(f"Window size:   {x_window_size}")
-    print(f"Epochs:        {epochs}")
-    print(f"Batch size:    {batch_size}")
-    print(f"Combo tag:     {combo_tag(symbol, resolution)}")
+    print(f"Symbol:                  {symbol}")
+    print(f"Resolution:              {resolution}")
+    print(f"Start date:              {start_date}")
+    print(f"End date:                {end_date}")
+    print(f"Window size:             {x_window_size}")
+    print(f"Epochs:                  {epochs}")
+    print(f"Batch size:              {batch_size}")
+    print(f"Train ratio:             {train_ratio}")
+    print(f"Validation split:        {validation_split} (within train block)")
+    print(f"Learning rate:           {learning_rate}")
+    print(f"LSTM units:              {lstm_units}")
+    print(f"Dropout rate:            {dropout_rate}")
+    print(f"Early stopping patience: {early_stopping_patience}")
+    print(f"Combo tag:               {combo_tag(symbol, resolution)}")
     print("===================================================\n")
 
-    # 1) Fetch candles
     client = BinanceDataClient(market="spot")
     df = client.get_candles(
         symbol=symbol,
@@ -142,7 +187,6 @@ def train_lstm_model(
     if df.empty:
         raise ValueError("No rows returned after raw candle cleaning.")
 
-    # 2) Feature engineering
     df = feature_engineering_lstm(df)
 
     feature_cols = [
@@ -155,7 +199,6 @@ def train_lstm_model(
     if df.empty:
         raise ValueError("No rows available after feature engineering and NA drop.")
 
-    # 3) Windowing + labels
     X, y = make_windows(df, x_window_size=x_window_size, feature_cols=feature_cols)
     X = np.asarray(X, dtype=np.float32)
     y = np.asarray(y, dtype=np.int32)
@@ -167,57 +210,73 @@ def train_lstm_model(
     if X.shape[2] != len(feature_cols):
         raise ValueError(f"Expected F={len(feature_cols)}, got {X.shape[2]}")
 
-    # 4) Chronological split
     n = len(X)
-    train_end = int(n * 0.95)
+    train_end = int(n * train_ratio)
+
     if train_end <= 0 or train_end >= n:
         raise ValueError(f"Not enough samples after windowing. n={n}")
 
-    X_train, X_test = X[:train_end], X[train_end:]
-    y_train, y_test = y[:train_end], y[train_end:]
+    X_train_full, X_test = X[:train_end], X[train_end:]
+    y_train_full, y_test = y[:train_end], y[train_end:]
 
-    # 5) Train-only StandardScaler
-    n_features = X_train.shape[-1]
+    if len(X_train_full) < 2 or len(X_test) < 1:
+        raise ValueError(
+            f"Insufficient samples after split. "
+            f"train={len(X_train_full)}, test={len(X_test)}"
+        )
+
+    n_features = X_train_full.shape[-1]
     scaler = StandardScaler()
 
-    X_train_2d = X_train.reshape(-1, n_features)
+    X_train_2d = X_train_full.reshape(-1, n_features)
     scaler.fit(X_train_2d)
 
     dump(scaler, str(scaler_path_p))
     print(f"✅ Saved scaler: {scaler_path_p}")
 
-    X_train_s = scaler.transform(X_train_2d).reshape(X_train.shape).astype(np.float32)
-    X_test_s = scaler.transform(X_test.reshape(-1, n_features)).reshape(X_test.shape).astype(np.float32)
+    X_train_s_full = (
+        scaler.transform(X_train_full.reshape(-1, n_features))
+        .reshape(X_train_full.shape)
+        .astype(np.float32)
+    )
+    X_test_s = (
+        scaler.transform(X_test.reshape(-1, n_features))
+        .reshape(X_test.shape)
+        .astype(np.float32)
+    )
 
-    # 6) Model
     model = Sequential([
         Input(shape=(x_window_size, n_features)),
-        LSTM(100, return_sequences=False),
-        Dropout(0.2),
+        LSTM(lstm_units, return_sequences=False),
+        Dropout(dropout_rate),
         Dense(1, activation="sigmoid"),
     ])
 
     model.compile(
-        optimizer=Adam(learning_rate=0.001),
+        optimizer=Adam(learning_rate=learning_rate),
         loss="binary_crossentropy",
         metrics=["accuracy"],
     )
 
     history = model.fit(
-        X_train_s,
-        y_train,
+        X_train_s_full,
+        y_train_full,
         epochs=epochs,
         batch_size=batch_size,
-        validation_split=0.05,
+        validation_split=validation_split,
         shuffle=False,
-        callbacks=[EarlyStopping(patience=3, restore_best_weights=True)],
+        callbacks=[
+            EarlyStopping(
+                patience=early_stopping_patience,
+                restore_best_weights=True,
+            )
+        ],
         verbose=1,
     )
 
     model.save(str(model_path_p))
     print(f"✅ Saved model: {model_path_p}")
 
-    # 7) Test probs + metrics
     p_test = model.predict(X_test_s, batch_size=batch_size, verbose=0).reshape(-1)
 
     out_df = pd.DataFrame({
@@ -236,7 +295,6 @@ def train_lstm_model(
     metrics_df.to_csv(str(metrics_path_p), index=False)
     print(f"✅ Saved metrics: {metrics_path_p}")
 
-    # 8) Save artifacts
     lstm_artifacts = {
         "model_path": str(model_path_p.relative_to(PROJECT_ROOT)),
         "scaler_path": str(scaler_path_p.relative_to(PROJECT_ROOT)),
@@ -253,14 +311,19 @@ def train_lstm_model(
         "thresholds_eval": tuple(float(t) for t in thresholds),
         "ignore_zone_threshold_for_sideways": 0.53,
         "market": "spot",
-        "train_split_ratio": 0.95,
+        "train_ratio": float(train_ratio),
+        "validation_split_within_train": float(validation_split),
+        "learning_rate": float(learning_rate),
+        "lstm_units": int(lstm_units),
+        "dropout_rate": float(dropout_rate),
+        "early_stopping_patience": int(early_stopping_patience),
     }
 
     dump(lstm_artifacts, str(artifacts_path_p))
     print(f"✅ Saved artifacts: {artifacts_path_p}")
 
     print("\n📊 Label balance:")
-    print(f"Train UP rate: {float(y_train.mean()):.4f}")
+    print(f"Train UP rate: {float(y_train_full.mean()):.4f}")
     print(f"Test  UP rate: {float(y_test.mean()):.4f}")
 
     return model, history, out_df, metrics_df, scaler

@@ -140,6 +140,96 @@ def majority_baseline_with_coverage(y_true: np.ndarray, coverage: float):
     return accuracy_score(y_true[used_mask], pred_used)
 
 
+def build_threshold_summary(y_true: np.ndarray, probs: np.ndarray, threshold: float) -> dict:
+    pred, used_mask = apply_ignore_zone(probs, threshold=threshold)
+
+    coverage = float(used_mask.mean())
+    used_samples = int(used_mask.sum())
+    total_samples = int(len(y_true))
+
+    result = {
+        "threshold": float(threshold),
+        "coverage": coverage,
+        "ignored_rate": 1.0 - coverage,
+        "used_samples": used_samples,
+        "total_samples": total_samples,
+        "used_accuracy": None,
+        "random_baseline_accuracy": None,
+        "majority_baseline_accuracy": None,
+        "confusion_matrix": None,
+        "classification_report_df": None,
+        "used_mask": used_mask,
+        "pred_used": None,
+    }
+
+    if used_samples == 0:
+        return result
+
+    y_true_used = y_true[used_mask]
+    y_pred_used = pred[used_mask]
+
+    used_accuracy = float((y_true_used == y_pred_used).mean())
+    cm = confusion_matrix(y_true_used, y_pred_used, labels=[0, 1])
+
+    report_df = pd.DataFrame(
+        classification_report(
+            y_true_used,
+            y_pred_used,
+            target_names=["DOWN", "UP"],
+            zero_division=0,
+            output_dict=True,
+        )
+    ).transpose()
+
+    result["used_accuracy"] = used_accuracy
+    result["random_baseline_accuracy"] = random_baseline_with_coverage(
+        y_true, coverage=coverage, seed=42
+    )
+    result["majority_baseline_accuracy"] = majority_baseline_with_coverage(
+        y_true, coverage=coverage
+    )
+    result["confusion_matrix"] = cm
+    result["classification_report_df"] = report_df
+    result["pred_used"] = y_pred_used
+
+    return result
+
+
+def build_distribution_tables(y_true: np.ndarray, used_mask: np.ndarray, pred_used):
+    actual_full = (
+        pd.Series(y_true)
+        .value_counts(normalize=True)
+        .sort_index()
+        .rename(index={0: "DOWN(0)", 1: "UP(1)"})
+        .reset_index()
+    )
+    actual_full.columns = ["Class", "Share"]
+
+    if used_mask.sum() == 0:
+        actual_used = pd.DataFrame(columns=["Class", "Share"])
+        pred_used_df = pd.DataFrame(columns=["Class", "Share"])
+    else:
+        actual_used = (
+            pd.Series(y_true[used_mask])
+            .value_counts(normalize=True)
+            .sort_index()
+            .rename(index={0: "DOWN(0)", 1: "UP(1)"})
+            .reset_index()
+        )
+        actual_used.columns = ["Class", "Share"]
+
+        pred_used_df = (
+            pd.Series(pred_used)
+            .value_counts(normalize=True)
+            .sort_index()
+            .rename(index={0: "DOWN(0)", 1: "UP(1)"})
+            .reset_index()
+        )
+        pred_used_df.columns = ["Class", "Share"]
+
+    return actual_full, actual_used, pred_used_df
+
+
 def main():
     symbol = "BTCUSDT"
     resolution = "1h"
@@ -147,6 +237,8 @@ def main():
     start_date = get_default_start_date(resolution)
     tag = combo_tag(symbol, resolution)
     save_paths = build_lstm_save_paths(symbol, resolution)
+
+    thresholds = (0.50, 0.51, 0.52, 0.53, 0.54, 0.55, 0.56, 0.57, 0.58)
 
     print("🚀 Starting LSTM Evaluation...\n")
     print(f"Symbol:      {symbol}")
@@ -164,12 +256,18 @@ def main():
         x_window_size=100,
         epochs=10,
         batch_size=64,
+        train_ratio=0.80,
+        validation_split=0.05,
+        learning_rate=0.001,
+        lstm_units=100,
+        dropout_rate=0.20,
+        early_stopping_patience=3,
         model_path=save_paths["model_path"],
         scaler_path=save_paths["scaler_path"],
         artifacts_path=save_paths["artifacts_path"],
         test_probs_path=save_paths["test_probs_path"],
         metrics_path=save_paths["metrics_path"],
-        thresholds=(0.50, 0.51, 0.52, 0.53, 0.54, 0.55, 0.56, 0.57, 0.58),
+        thresholds=thresholds,
     )
 
     print("\n================ TRAINING SUMMARY ================")
@@ -184,7 +282,7 @@ def main():
     evaluate_auc(y_true, probs)
 
     print("\n📊 ================= THRESHOLDS + BASELINES =================")
-    for t in [0.50, 0.51, 0.52, 0.53, 0.54, 0.55, 0.56, 0.57, 0.58]:
+    for t in thresholds:
         print("\n" + "=" * 55)
 
         coverage = evaluate_threshold(y_true, probs, threshold=t)
