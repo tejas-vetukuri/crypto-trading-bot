@@ -6,6 +6,7 @@ from services.market_data import fetch_klines
 from services.predictions import fetch_live_predictions
 from services.sentiment import fetch_sentiment_snapshot
 from services.trade_history import fetch_recent_rl_replay_trades
+from services.local_inference import generate_local_inference
 from components.charts import make_candlestick_chart
 
 
@@ -207,6 +208,9 @@ try:
 
     st.markdown("## Sentiment")
 
+    sentiment = None
+    recent_trades = []
+
     try:
         sentiment = fetch_sentiment_snapshot(
             symbol=coin,
@@ -393,6 +397,83 @@ try:
 
     except Exception as e:
         st.warning(f"Could not load RL trade replay: {e}")
+
+    st.markdown("## AI Inference")
+    try:
+        ai_inference = generate_local_inference(
+            predictions=predictions,
+            sentiment=sentiment,
+            recent_trades=recent_trades,
+        )
+
+        st.markdown(
+            f"""
+            <div style="
+                border: 1px solid #2e2e2e;
+                border-radius: 14px;
+                padding: 18px;
+                background-color: #111827;
+                box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+                margin-bottom: 12px;
+            ">
+                <div style="font-size: 1.2rem; font-weight: 700; color: #e5e7eb; margin-bottom: 8px;">
+                    {ai_inference["headline"]}
+                </div>
+                <div style="font-size: 0.95rem; color: #cbd5e1; line-height: 1.6;">
+                    {ai_inference["summary"]}
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        with st.expander("Why LSTM predicted this"):
+            st.write(ai_inference["lstm_reason"])
+
+        with st.expander("Why XGBoost predicted this"):
+            st.write(ai_inference["xgb_reason"])
+
+        with st.expander("Why the ensemble predicted this"):
+            st.write(ai_inference["ensemble_reason"])
+
+        with st.expander("Why RL took or filtered the trade"):
+            st.write(ai_inference["rl_reason"])
+
+        with st.expander("How sentiment supports or conflicts"):
+            st.write(ai_inference["sentiment_reason"])
+
+        with st.expander("What recent RL trades suggest"):
+            st.write(ai_inference["trade_history_reason"])
+
+        st.info(ai_inference["confidence_note"])
+        st.caption(ai_inference["risk_note"])
+
+    except Exception as e:
+        st.warning(f"AI inference unavailable: {e}")
+
+    st.markdown("## Trade Settings")
+
+    c1, c2, c3 = st.columns(3)
+    c4, c5, c6 = st.columns(3)
+
+    c1.metric("Capital", "$5,000")
+    c2.metric("RR", "1 : 1.25")
+    c3.metric("Leverage", "25x")
+
+    c4.metric("Horizon", "3 candles")
+    c5.metric("Fee per Trade", "2 bps")
+    c6.metric("Ensemble Weights", "LSTM 0.2 | XGB 0.8")
+
+    c7, c8, c9 = st.columns(3)
+
+    c7.metric("Risk per Trade", "2%")
+    c8.metric("SL ATR Multiplier", "1.0")
+    c9.metric("Min ATR %", "0.10%")
+
+    st.caption(
+        "Live predictions use a 0.2 / 0.8 LSTM-XGBoost ensemble, horizon=3 candles, "
+        "with RL acting as the final trade filter."
+    )
 
 except Exception as e:
     st.error(f"Failed to load live signal data: {e}")

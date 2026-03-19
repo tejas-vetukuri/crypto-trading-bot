@@ -31,7 +31,7 @@ def predict_xgb_latest(X_latest, xgb_artifacts: dict) -> dict:
         "margin_threshold": margin_threshold,
         "margin": float(margin),
         "used": used,
-        "probability": probability,               # matches saved preds_csv meaning
+        "probability": probability,
     }
 
 
@@ -58,7 +58,7 @@ def predict_lstm_latest(X_latest_window, lstm_model, threshold: float = 0.52) ->
         used = 0
 
     return {
-        "pred_class": pred_class,                 # 0=SHORT, 1=LONG, 2=SIDEWAYS
+        "pred_class": pred_class,
         "pred_label": pred_label,
         "prob_up": prob_up,
         "confidence": confidence,
