@@ -1,5 +1,3 @@
-#eval_ensemble_only.py
-
 from __future__ import annotations
 
 from dataclasses import replace
@@ -140,6 +138,7 @@ def _run_ensemble_trade_simulation(
         "sl_exits": sl_exits,
         "horizon_exits": horizon_exits,
         "other_exits": other_exits,
+        "equity_curve": equity_curve,
     }
 
 
@@ -152,8 +151,8 @@ def _print_trade_block(
 ):
     print(f"\n---------------- {title} ----------------")
     print(f"Candidate setups from ensemble:  {metrics_with_fees['setups']}")
-    print(f"Taken by RL:                     {metrics_with_fees['taken']}")
-    print(f"Skipped by RL:                   {metrics_with_fees['skipped']}")
+    print(f"Taken by ensemble:               {metrics_with_fees['taken']}")
+    print(f"Skipped by ensemble:             {metrics_with_fees['skipped']}")
     print(f"Take rate on setups:             {metrics_with_fees['take_rate']:.4f}")
     print(f"Directional Accuracy (taken):    {metrics_with_fees['directional_accuracy']:.4f}")
     print(f"Win Rate:                        {metrics_with_fees['win_rate']:.4f}")
@@ -190,7 +189,8 @@ def evaluate_ensemble_only(
     ensemble_upper: float = 0.60,
     ensemble_lower: float = 0.40,
     max_horizon: int = 3,
-):
+    verbose: bool = True,
+) -> dict:
     client = BinanceDataClient()
     df_raw = client.get_candles(
         symbol=symbol,
@@ -211,7 +211,7 @@ def evaluate_ensemble_only(
         xgb_artifacts_path=xgb_artifacts_path,
         lstm_artifacts_path=lstm_artifacts_path,
         lstm_threshold=lstm_threshold,
-    )
+    ).copy()
 
     actual = merged["actual"].values
 
@@ -229,10 +229,14 @@ def evaluate_ensemble_only(
         mask=lstm_mask,
     )
 
+    weight_sum = ensemble_weight_xgb + ensemble_weight_lstm
+    if weight_sum <= 0:
+        raise ValueError("ensemble_weight_xgb + ensemble_weight_lstm must be > 0")
+
     p_ens = (
         ensemble_weight_xgb * merged["xgb_p_up"].values
         + ensemble_weight_lstm * merged["lstm_p_up"].values
-    ) / (ensemble_weight_xgb + ensemble_weight_lstm)
+    ) / weight_sum
 
     ens_pred_2way = (p_ens >= 0.5).astype(int)
     ens_acc_2way, ens_n_2way = _evaluate_binary_model(actual=actual, pred=ens_pred_2way)
@@ -249,6 +253,15 @@ def evaluate_ensemble_only(
     agree_mask = xgb_dir == lstm_dir
     agree_pred = xgb_dir
     agree_acc, agree_n = _evaluate_binary_model(actual=actual, pred=agree_pred, mask=agree_mask)
+
+    merged["ensemble_p_up"] = p_ens
+    merged["ensemble_pred_2way"] = ens_pred_2way
+    merged["ensemble_pred_3way"] = ens_pred_3way
+    merged["ensemble_signal"] = np.where(
+        ens_pred_3way == 1,
+        "up",
+        np.where(ens_pred_3way == 0, "down", "hold"),
+    )
 
     risk_no_fees = replace(risk, fee_bps=0.0, trade_penalty_bps=0.0)
 
@@ -272,28 +285,57 @@ def evaluate_ensemble_only(
         max_horizon=max_horizon,
     )
 
-    print("\n================ TEST SET SUMMARY ================")
-    print(f"Rows evaluated:                  {len(merged)}")
-    print(f"Train ratio used:                {train_ratio:.2f}")
+    result = {
+        "rows_evaluated": len(merged),
+        "train_ratio": train_ratio,
+        "base_metrics": {
+            "xgb_accuracy_non_hold": xgb_acc_non_hold,
+            "xgb_n": xgb_n,
+            "lstm_accuracy_non_hold": lstm_acc_non_hold,
+            "lstm_n": lstm_n,
+        },
+        "ensemble_metrics": {
+            "ensemble_2way_accuracy": ens_acc_2way,
+            "ensemble_2way_n": ens_n_2way,
+            "ensemble_3way_accuracy_non_hold": ens_acc_non_hold,
+            "ensemble_3way_n_non_hold": ens_n_non_hold,
+            "agreement_only_accuracy": agree_acc,
+            "agreement_only_n": agree_n,
+            "ensemble_weight_xgb": ensemble_weight_xgb,
+            "ensemble_weight_lstm": ensemble_weight_lstm,
+            "ensemble_upper": ensemble_upper,
+            "ensemble_lower": ensemble_lower,
+        },
+        "trade_metrics_with_fees": metrics_with_fees,
+        "trade_metrics_no_fees": metrics_no_fees,
+        "merged_preview": merged,
+    }
 
-    print("\n---------------- Base Models ----------------")
-    print(f"XGB accuracy (non-hold):         {xgb_acc_non_hold:.4f}  | n={xgb_n}")
-    print(f"LSTM accuracy (non-hold):        {lstm_acc_non_hold:.4f} | n={lstm_n}")
+    if verbose:
+        print("\n================ TEST SET SUMMARY ================")
+        print(f"Rows evaluated:                  {len(merged)}")
+        print(f"Train ratio used:                {train_ratio:.2f}")
 
-    print("\n---------------- Raw Ensemble ----------------")
-    print(f"Ensemble 2-way accuracy:         {ens_acc_2way:.4f}  | n={ens_n_2way}")
-    print(f"Ensemble 3-way acc (non-hold):   {ens_acc_non_hold:.4f} | n={ens_n_non_hold}")
-    print(f"Agreement-only accuracy:         {agree_acc:.4f}  | n={agree_n}")
-    print(f"Ensemble weights:                xgb={ensemble_weight_xgb:.2f}, lstm={ensemble_weight_lstm:.2f}")
-    print(f"Ensemble hold band:              [{ensemble_lower:.2f}, {ensemble_upper:.2f}]")
+        print("\n---------------- Base Models ----------------")
+        print(f"XGB accuracy (non-hold):         {xgb_acc_non_hold:.4f}  | n={xgb_n}")
+        print(f"LSTM accuracy (non-hold):        {lstm_acc_non_hold:.4f} | n={lstm_n}")
 
-    _print_trade_block(
-        title="Ensemble-Only Trade Simulation",
-        metrics_with_fees=metrics_with_fees,
-        metrics_no_fees=metrics_no_fees,
-        risk=risk,
-        max_horizon=max_horizon,
-    )
+        print("\n---------------- Raw Ensemble ----------------")
+        print(f"Ensemble 2-way accuracy:         {ens_acc_2way:.4f}  | n={ens_n_2way}")
+        print(f"Ensemble 3-way acc (non-hold):   {ens_acc_non_hold:.4f} | n={ens_n_non_hold}")
+        print(f"Agreement-only accuracy:         {agree_acc:.4f}  | n={agree_n}")
+        print(f"Ensemble weights:                xgb={ensemble_weight_xgb:.2f}, lstm={ensemble_weight_lstm:.2f}")
+        print(f"Ensemble hold band:              [{ensemble_lower:.2f}, {ensemble_upper:.2f}]")
+
+        _print_trade_block(
+            title="Ensemble-Only Trade Simulation",
+            metrics_with_fees=metrics_with_fees,
+            metrics_no_fees=metrics_no_fees,
+            risk=risk,
+            max_horizon=max_horizon,
+        )
+
+    return result
 
 
 if __name__ == "__main__":
@@ -305,7 +347,7 @@ if __name__ == "__main__":
         train_ratio=0.80,
         xgb_artifacts_path="models/xgboost/xgb_trend_artifacts.joblib",
         lstm_artifacts_path="models/lstm/lstm_artifacts.joblib",
-        lstm_threshold=0.52,
+        lstm_threshold=0.53,
         risk=RiskConfig(
             capital_usd=5000.0,
             risk_per_trade=0.02,
@@ -321,4 +363,5 @@ if __name__ == "__main__":
         ensemble_upper=0.60,
         ensemble_lower=0.40,
         max_horizon=3,
+        verbose=True,
     )

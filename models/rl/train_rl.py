@@ -4,7 +4,7 @@ from models.rl.rl_ensemble import train_rl_policy, RiskConfig
 if __name__ == "__main__":
     train_rl_policy(
         symbol="BTCUSDT",
-        resolution="4h",
+        resolution="1h",
         end_date=None,
         train_ratio=0.80,
         lstm_threshold=0.53,

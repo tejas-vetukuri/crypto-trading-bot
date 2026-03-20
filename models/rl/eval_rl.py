@@ -182,43 +182,8 @@ def _run_rl_trade_simulation(
         "sl_exits": sl_exits,
         "horizon_exits": horizon_exits,
         "other_exits": other_exits,
+        "equity_curve": equity_curve,
     }
-
-
-def _print_trade_block(
-    title: str,
-    metrics_with_fees: dict,
-    metrics_no_fees: dict,
-    risk: RiskConfig,
-    max_horizon: int,
-    min_take_visits: int,
-    q_take_margin: float,
-):
-    print(f"\n---------------- {title} ----------------")
-    print(f"Candidate setups from ensemble:  {metrics_with_fees['setups']}")
-    print(f"Taken by RL:                     {metrics_with_fees['taken']}")
-    print(f"Skipped by RL:                   {metrics_with_fees['skipped']}")
-    print(f"Take rate on setups:             {metrics_with_fees['take_rate']:.4f}")
-    print(f"Directional Accuracy (taken):    {metrics_with_fees['directional_accuracy']:.4f}")
-    print(f"Win Rate:                        {metrics_with_fees['win_rate']:.4f}")
-    print(f"Average Gross R / trade:         {metrics_with_fees['avg_gross_r_per_trade']:.4f}")
-    print(f"Average Net R / trade:           {metrics_with_fees['avg_net_r_per_trade']:.4f}")
-    print(f"Total Return:                    {metrics_with_fees['total_return']:.4f}")
-    print(f"Total Return (no fees):          {metrics_no_fees['total_return']:.4f}")
-    print(f"Max Drawdown:                    {metrics_with_fees['max_drawdown']:.4f}")
-    print(f"Max Drawdown (no fees):          {metrics_no_fees['max_drawdown']:.4f}")
-    print(f"TP exits:                        {metrics_with_fees['tp_exits']}")
-    print(f"SL exits:                        {metrics_with_fees['sl_exits']}")
-    print(f"Horizon exits:                   {metrics_with_fees['horizon_exits']}")
-    print(f"Other exits:                     {metrics_with_fees['other_exits']}")
-    print(f"Max horizon:                     {max_horizon}")
-    print(f"Min take visits:                 {min_take_visits}")
-    print(f"Q take margin:                   {q_take_margin:.4f}")
-    print(f"RR target:                       {risk.rr:.2f}")
-    print(f"SL ATR multiplier:               {risk.sl_atr_mult:.2f}")
-    print(f"Risk per trade:                  {risk.risk_per_trade:.4f}")
-    print(f"Fee bps:                         {risk.fee_bps}")
-    print(f"Trade penalty bps:               {risk.trade_penalty_bps}")
 
 
 def evaluate_rl_agent(
@@ -378,19 +343,127 @@ def evaluate_rl_agent(
     print(f"Ensemble weights:                xgb={ensemble_weight_xgb:.2f}, lstm={ensemble_weight_lstm:.2f}")
     print(f"Ensemble hold band:              [{ensemble_lower:.2f}, {ensemble_upper:.2f}]")
 
-    _print_trade_block(
-        title="RL Trade Filter",
-        metrics_with_fees=metrics_with_fees,
-        metrics_no_fees=metrics_no_fees,
-        risk=risk,
-        max_horizon=max_horizon,
-        min_take_visits=min_take_visits,
-        q_take_margin=q_take_margin,
+    print("\n---------------- RL Trade Filter ----------------")
+    print(f"Candidate setups from ensemble:  {metrics_with_fees['setups']}")
+    print(f"Taken by RL:                     {metrics_with_fees['taken']}")
+    print(f"Skipped by RL:                   {metrics_with_fees['skipped']}")
+    print(f"Take rate on setups:             {metrics_with_fees['take_rate']:.4f}")
+    print(f"Directional Accuracy (taken):    {metrics_with_fees['directional_accuracy']:.4f}")
+    print(f"Win Rate:                        {metrics_with_fees['win_rate']:.4f}")
+    print(f"Average Gross R / trade:         {metrics_with_fees['avg_gross_r_per_trade']:.4f}")
+    print(f"Average Net R / trade:           {metrics_with_fees['avg_net_r_per_trade']:.4f}")
+    print(f"Total Return:                    {metrics_with_fees['total_return']:.4f}")
+    print(f"Total Return (no fees):          {metrics_no_fees['total_return']:.4f}")
+    print(f"Max Drawdown:                    {metrics_with_fees['max_drawdown']:.4f}")
+    print(f"Max Drawdown (no fees):          {metrics_no_fees['max_drawdown']:.4f}")
+    print(f"TP exits:                        {metrics_with_fees['tp_exits']}")
+    print(f"SL exits:                        {metrics_with_fees['sl_exits']}")
+    print(f"Horizon exits:                   {metrics_with_fees['horizon_exits']}")
+    print(f"Other exits:                     {metrics_with_fees['other_exits']}")
+
+    summary_df = pd.DataFrame(
+        [
+            {"metric": "Rows evaluated", "value": float(len(merged))},
+            {"metric": "Train ratio used", "value": float(train_ratio)},
+            {"metric": "XGB accuracy (non-hold)", "value": float(xgb_acc_non_hold)},
+            {"metric": "XGB non-hold n", "value": float(xgb_n)},
+            {"metric": "LSTM accuracy (non-hold)", "value": float(lstm_acc_non_hold)},
+            {"metric": "LSTM non-hold n", "value": float(lstm_n)},
+            {"metric": "Ensemble 2-way accuracy", "value": float(ens_acc_2way)},
+            {"metric": "Ensemble 2-way n", "value": float(ens_n_2way)},
+            {"metric": "Ensemble 3-way accuracy (non-hold)", "value": float(ens_acc_non_hold)},
+            {"metric": "Ensemble 3-way non-hold n", "value": float(ens_n_non_hold)},
+            {"metric": "Agreement-only accuracy", "value": float(agree_acc)},
+            {"metric": "Agreement-only n", "value": float(agree_n)},
+            {"metric": "RL candidate setups", "value": float(metrics_with_fees["setups"])},
+            {"metric": "RL taken", "value": float(metrics_with_fees["taken"])},
+            {"metric": "RL skipped", "value": float(metrics_with_fees["skipped"])},
+            {"metric": "RL take rate", "value": float(metrics_with_fees["take_rate"])},
+            {"metric": "RL directional accuracy", "value": float(metrics_with_fees["directional_accuracy"])},
+            {"metric": "RL win rate", "value": float(metrics_with_fees["win_rate"])},
+            {"metric": "RL avg gross R / trade", "value": float(metrics_with_fees["avg_gross_r_per_trade"])},
+            {"metric": "RL avg net R / trade", "value": float(metrics_with_fees["avg_net_r_per_trade"])},
+            {"metric": "RL total return", "value": float(metrics_with_fees["total_return"])},
+            {"metric": "RL total return (no fees)", "value": float(metrics_no_fees["total_return"])},
+            {"metric": "RL max drawdown", "value": float(metrics_with_fees["max_drawdown"])},
+            {"metric": "RL max drawdown (no fees)", "value": float(metrics_no_fees["max_drawdown"])},
+            {"metric": "RL TP exits", "value": float(metrics_with_fees["tp_exits"])},
+            {"metric": "RL SL exits", "value": float(metrics_with_fees["sl_exits"])},
+            {"metric": "RL horizon exits", "value": float(metrics_with_fees["horizon_exits"])},
+            {"metric": "RL other exits", "value": float(metrics_with_fees["other_exits"])},
+        ]
     )
+
+    trades_df = pd.DataFrame(
+        [
+            {
+                "setup_metric": "setups",
+                "value": metrics_with_fees["setups"],
+            },
+            {
+                "setup_metric": "taken",
+                "value": metrics_with_fees["taken"],
+            },
+            {
+                "setup_metric": "skipped",
+                "value": metrics_with_fees["skipped"],
+            },
+        ]
+    )
+
+    return {
+        "summary_df": summary_df,
+        "trades_df": trades_df,
+        "merged_df": merged,
+        "equity_curve_with_fees": pd.DataFrame(
+            {
+                "trade_index": np.arange(len(metrics_with_fees["equity_curve"])),
+                "equity": metrics_with_fees["equity_curve"],
+            }
+        ),
+        "equity_curve_no_fees": pd.DataFrame(
+            {
+                "trade_index": np.arange(len(metrics_no_fees["equity_curve"])),
+                "equity": metrics_no_fees["equity_curve"],
+            }
+        ),
+        "base_metrics": {
+            "xgb_acc_non_hold": xgb_acc_non_hold,
+            "xgb_n": xgb_n,
+            "lstm_acc_non_hold": lstm_acc_non_hold,
+            "lstm_n": lstm_n,
+            "ens_acc_2way": ens_acc_2way,
+            "ens_n_2way": ens_n_2way,
+            "ens_acc_non_hold": ens_acc_non_hold,
+            "ens_n_non_hold": ens_n_non_hold,
+            "agree_acc": agree_acc,
+            "agree_n": agree_n,
+        },
+        "rl_metrics_with_fees": metrics_with_fees,
+        "rl_metrics_no_fees": metrics_no_fees,
+        "config": {
+            "symbol": symbol,
+            "resolution": resolution,
+            "start_date": start_date,
+            "end_date": end_date,
+            "train_ratio": train_ratio,
+            "lstm_threshold": lstm_threshold,
+            "ensemble_weight_xgb": ensemble_weight_xgb,
+            "ensemble_weight_lstm": ensemble_weight_lstm,
+            "ensemble_upper": ensemble_upper,
+            "ensemble_lower": ensemble_lower,
+            "max_horizon": max_horizon,
+            "min_take_visits": min_take_visits,
+            "q_take_margin": q_take_margin,
+            "xgb_artifacts_path": str(xgb_artifacts_path_p),
+            "lstm_artifacts_path": str(lstm_artifacts_path_p),
+            "rl_agent_path": str(rl_agent_path_p),
+        },
+    }
 
 
 if __name__ == "__main__":
-    evaluate_rl_agent(
+    results = evaluate_rl_agent(
         risk=RiskConfig(
             capital_usd=5000.0,
             risk_per_trade=0.02,
@@ -407,3 +480,4 @@ if __name__ == "__main__":
         min_take_visits=20,
         q_take_margin=0.20,
     )
+    print(results["summary_df"])

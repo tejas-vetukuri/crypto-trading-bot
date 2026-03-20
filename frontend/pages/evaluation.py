@@ -24,6 +24,13 @@ from models.xgboost.train_eval_xgb import (
     build_xgb_margin_sweep,
     build_xgb_distribution_tables,
 )
+from models.rl.eval_ensemble_only import evaluate_ensemble_only
+from models.rl.rl_ensemble import (
+    RiskConfig,
+    train_rl_policy,
+    build_combo_artifact_paths,
+)
+from models.rl.eval_rl import evaluate_rl_agent
 
 
 st.set_page_config(page_title="Model Evaluation Lab", layout="wide")
@@ -239,12 +246,202 @@ def render_xgb_results(results: dict):
         "used",
         "probability",
     ]
+    preview_cols = [c for c in preview_cols if c in output_df.columns]
     st.dataframe(output_df[preview_cols].head(50), use_container_width=True, hide_index=True)
 
     st.markdown("#### Saved Artifacts")
     paths_df = pd.DataFrame([
         {"Artifact": "Artifacts Path", "Value": str(save_paths["artifacts_path"])},
         {"Artifact": "Predictions CSV Path", "Value": str(save_paths["preds_csv_path"])},
+    ])
+    st.dataframe(paths_df, use_container_width=True, hide_index=True)
+
+
+def render_ensemble_results(results: dict):
+    base_metrics = results["base_metrics"]
+    ensemble_metrics = results["ensemble_metrics"]
+    trade_with_fees = results["trade_metrics_with_fees"]
+    trade_no_fees = results["trade_metrics_no_fees"]
+    merged_preview = results["merged_preview"]
+
+    st.markdown("### Results")
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("XGB Acc (non-hold)", f"{base_metrics['xgb_accuracy_non_hold']:.4f}")
+    c2.metric("LSTM Acc (non-hold)", f"{base_metrics['lstm_accuracy_non_hold']:.4f}")
+    c3.metric("Ensemble 2-way Acc", f"{ensemble_metrics['ensemble_2way_accuracy']:.4f}")
+    c4.metric("Ensemble 3-way Acc", f"{ensemble_metrics['ensemble_3way_accuracy_non_hold']:.4f}")
+
+    summary_df = pd.DataFrame([
+        {"Metric": "Rows Evaluated", "Value": results["rows_evaluated"]},
+        {"Metric": "Train/Test Split", "Value": f"{results['train_ratio']:.2f} / {1 - results['train_ratio']:.2f}"},
+        {"Metric": "XGB Non-hold Accuracy", "Value": f"{base_metrics['xgb_accuracy_non_hold']:.4f}"},
+        {"Metric": "XGB Non-hold Sample Count", "Value": base_metrics["xgb_n"]},
+        {"Metric": "LSTM Non-hold Accuracy", "Value": f"{base_metrics['lstm_accuracy_non_hold']:.4f}"},
+        {"Metric": "LSTM Non-hold Sample Count", "Value": base_metrics["lstm_n"]},
+        {"Metric": "Ensemble 2-way Accuracy", "Value": f"{ensemble_metrics['ensemble_2way_accuracy']:.4f}"},
+        {"Metric": "Ensemble 2-way Sample Count", "Value": ensemble_metrics["ensemble_2way_n"]},
+        {
+            "Metric": "Ensemble 3-way Accuracy (non-hold)",
+            "Value": f"{ensemble_metrics['ensemble_3way_accuracy_non_hold']:.4f}",
+        },
+        {"Metric": "Ensemble 3-way Non-hold Sample Count", "Value": ensemble_metrics["ensemble_3way_n_non_hold"]},
+        {"Metric": "Agreement-only Accuracy", "Value": f"{ensemble_metrics['agreement_only_accuracy']:.4f}"},
+        {"Metric": "Agreement-only Sample Count", "Value": ensemble_metrics["agreement_only_n"]},
+        {"Metric": "XGB Weight", "Value": f"{ensemble_metrics['ensemble_weight_xgb']:.2f}"},
+        {"Metric": "LSTM Weight", "Value": f"{ensemble_metrics['ensemble_weight_lstm']:.2f}"},
+        {"Metric": "Ensemble Lower", "Value": f"{ensemble_metrics['ensemble_lower']:.2f}"},
+        {"Metric": "Ensemble Upper", "Value": f"{ensemble_metrics['ensemble_upper']:.2f}"},
+    ])
+    st.markdown("#### Ensemble Summary")
+    st.dataframe(summary_df, use_container_width=True, hide_index=True)
+
+    t1, t2, t3, t4 = st.columns(4)
+    t1.metric("Setups", trade_with_fees["setups"])
+    t2.metric("Win Rate", f"{trade_with_fees['win_rate']:.4f}")
+    t3.metric("Avg Net R / Trade", f"{trade_with_fees['avg_net_r_per_trade']:.4f}")
+    t4.metric("Total Return", f"{trade_with_fees['total_return']:.4f}")
+
+    trade_df = pd.DataFrame([
+        {"Metric": "Setups", "With Fees": trade_with_fees["setups"], "No Fees": trade_no_fees["setups"]},
+        {"Metric": "Taken", "With Fees": trade_with_fees["taken"], "No Fees": trade_no_fees["taken"]},
+        {"Metric": "Take Rate", "With Fees": f"{trade_with_fees['take_rate']:.4f}", "No Fees": f"{trade_no_fees['take_rate']:.4f}"},
+        {
+            "Metric": "Directional Accuracy",
+            "With Fees": f"{trade_with_fees['directional_accuracy']:.4f}",
+            "No Fees": f"{trade_no_fees['directional_accuracy']:.4f}",
+        },
+        {"Metric": "Win Rate", "With Fees": f"{trade_with_fees['win_rate']:.4f}", "No Fees": f"{trade_no_fees['win_rate']:.4f}"},
+        {
+            "Metric": "Avg Gross R / Trade",
+            "With Fees": f"{trade_with_fees['avg_gross_r_per_trade']:.4f}",
+            "No Fees": f"{trade_no_fees['avg_gross_r_per_trade']:.4f}",
+        },
+        {
+            "Metric": "Avg Net R / Trade",
+            "With Fees": f"{trade_with_fees['avg_net_r_per_trade']:.4f}",
+            "No Fees": f"{trade_no_fees['avg_net_r_per_trade']:.4f}",
+        },
+        {"Metric": "Total Return", "With Fees": f"{trade_with_fees['total_return']:.4f}", "No Fees": f"{trade_no_fees['total_return']:.4f}"},
+        {"Metric": "Max Drawdown", "With Fees": f"{trade_with_fees['max_drawdown']:.4f}", "No Fees": f"{trade_no_fees['max_drawdown']:.4f}"},
+        {"Metric": "TP Exits", "With Fees": trade_with_fees["tp_exits"], "No Fees": trade_no_fees["tp_exits"]},
+        {"Metric": "SL Exits", "With Fees": trade_with_fees["sl_exits"], "No Fees": trade_no_fees["sl_exits"]},
+        {"Metric": "Horizon Exits", "With Fees": trade_with_fees["horizon_exits"], "No Fees": trade_no_fees["horizon_exits"]},
+        {"Metric": "Other Exits", "With Fees": trade_with_fees["other_exits"], "No Fees": trade_no_fees["other_exits"]},
+    ])
+    st.markdown("#### Trade Simulation")
+    st.dataframe(trade_df, use_container_width=True, hide_index=True)
+
+    st.markdown("#### Ensemble Preview")
+    preview_cols = [
+        "timestamp",
+        "actual",
+        "xgb_pred",
+        "lstm_pred",
+        "xgb_p_up",
+        "lstm_p_up",
+        "ensemble_p_up",
+        "ensemble_pred_2way",
+        "ensemble_pred_3way",
+        "ensemble_signal",
+    ]
+    preview_cols = [c for c in preview_cols if c in merged_preview.columns]
+    st.dataframe(merged_preview[preview_cols].head(50), use_container_width=True, hide_index=True)
+
+
+def render_rl_results(results: dict):
+    base = results["base_metrics"]
+    rl_fees = results["rl_metrics_with_fees"]
+    rl_no_fees = results["rl_metrics_no_fees"]
+    cfg = results["config"]
+
+    st.markdown("### Results")
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Candidate Setups", int(rl_fees["setups"]))
+    c2.metric("Taken by RL", int(rl_fees["taken"]))
+    c3.metric("Take Rate", f"{rl_fees['take_rate']:.4f}")
+    c4.metric("Win Rate", f"{rl_fees['win_rate']:.4f}")
+
+    c5, c6, c7, c8 = st.columns(4)
+    c5.metric("Avg Gross R / Trade", f"{rl_fees['avg_gross_r_per_trade']:.4f}")
+    c6.metric("Avg Net R / Trade", f"{rl_fees['avg_net_r_per_trade']:.4f}")
+    c7.metric("Total Return", f"{rl_fees['total_return']:.4f}")
+    c8.metric("Max Drawdown", f"{rl_fees['max_drawdown']:.4f}")
+
+    summary_df = pd.DataFrame([
+        {"Metric": "Rows Evaluated", "Value": len(results["merged_df"])},
+        {"Metric": "Train Ratio Used", "Value": f"{cfg['train_ratio']:.2f}"},
+        {"Metric": "XGB Accuracy (non-hold)", "Value": f"{base['xgb_acc_non_hold']:.4f}"},
+        {"Metric": "XGB Non-hold n", "Value": base["xgb_n"]},
+        {"Metric": "LSTM Accuracy (non-hold)", "Value": f"{base['lstm_acc_non_hold']:.4f}"},
+        {"Metric": "LSTM Non-hold n", "Value": base["lstm_n"]},
+        {"Metric": "Ensemble 2-way Accuracy", "Value": f"{base['ens_acc_2way']:.4f}"},
+        {"Metric": "Ensemble 2-way n", "Value": base["ens_n_2way"]},
+        {"Metric": "Ensemble 3-way Accuracy (non-hold)", "Value": f"{base['ens_acc_non_hold']:.4f}"},
+        {"Metric": "Ensemble 3-way Non-hold n", "Value": base["ens_n_non_hold"]},
+        {"Metric": "Agreement-only Accuracy", "Value": f"{base['agree_acc']:.4f}"},
+        {"Metric": "Agreement-only n", "Value": base["agree_n"]},
+        {"Metric": "Ensemble Weight XGB", "Value": f"{cfg['ensemble_weight_xgb']:.2f}"},
+        {"Metric": "Ensemble Weight LSTM", "Value": f"{cfg['ensemble_weight_lstm']:.2f}"},
+        {"Metric": "Ensemble Lower", "Value": f"{cfg['ensemble_lower']:.2f}"},
+        {"Metric": "Ensemble Upper", "Value": f"{cfg['ensemble_upper']:.2f}"},
+        {"Metric": "Min Take Visits", "Value": cfg["min_take_visits"]},
+        {"Metric": "Q Take Margin", "Value": f"{cfg['q_take_margin']:.4f}"},
+    ])
+    st.markdown("#### RL Filter Summary")
+    st.dataframe(summary_df, use_container_width=True, hide_index=True)
+
+    trade_df = pd.DataFrame([
+        {"Metric": "Setups", "With Fees": rl_fees["setups"], "No Fees": rl_no_fees["setups"]},
+        {"Metric": "Taken", "With Fees": rl_fees["taken"], "No Fees": rl_no_fees["taken"]},
+        {"Metric": "Skipped", "With Fees": rl_fees["skipped"], "No Fees": rl_no_fees["skipped"]},
+        {"Metric": "Take Rate", "With Fees": f"{rl_fees['take_rate']:.4f}", "No Fees": f"{rl_no_fees['take_rate']:.4f}"},
+        {
+            "Metric": "Directional Accuracy",
+            "With Fees": f"{rl_fees['directional_accuracy']:.4f}",
+            "No Fees": f"{rl_no_fees['directional_accuracy']:.4f}",
+        },
+        {"Metric": "Win Rate", "With Fees": f"{rl_fees['win_rate']:.4f}", "No Fees": f"{rl_no_fees['win_rate']:.4f}"},
+        {
+            "Metric": "Avg Gross R / Trade",
+            "With Fees": f"{rl_fees['avg_gross_r_per_trade']:.4f}",
+            "No Fees": f"{rl_no_fees['avg_gross_r_per_trade']:.4f}",
+        },
+        {
+            "Metric": "Avg Net R / Trade",
+            "With Fees": f"{rl_fees['avg_net_r_per_trade']:.4f}",
+            "No Fees": f"{rl_no_fees['avg_net_r_per_trade']:.4f}",
+        },
+        {"Metric": "Total Return", "With Fees": f"{rl_fees['total_return']:.4f}", "No Fees": f"{rl_no_fees['total_return']:.4f}"},
+        {"Metric": "Max Drawdown", "With Fees": f"{rl_fees['max_drawdown']:.4f}", "No Fees": f"{rl_no_fees['max_drawdown']:.4f}"},
+        {"Metric": "TP Exits", "With Fees": rl_fees["tp_exits"], "No Fees": rl_no_fees["tp_exits"]},
+        {"Metric": "SL Exits", "With Fees": rl_fees["sl_exits"], "No Fees": rl_no_fees["sl_exits"]},
+        {"Metric": "Horizon Exits", "With Fees": rl_fees["horizon_exits"], "No Fees": rl_no_fees["horizon_exits"]},
+        {"Metric": "Other Exits", "With Fees": rl_fees["other_exits"], "No Fees": rl_no_fees["other_exits"]},
+    ])
+    st.markdown("#### Trade Simulation")
+    st.dataframe(trade_df, use_container_width=True, hide_index=True)
+
+    st.markdown("#### RL Preview")
+    preview_cols = [
+        "timestamp",
+        "actual",
+        "xgb_pred",
+        "lstm_pred",
+        "xgb_p_up",
+        "lstm_p_up",
+        "close",
+        "atr",
+    ]
+    preview_cols = [c for c in preview_cols if c in results["merged_df"].columns]
+    st.dataframe(results["merged_df"][preview_cols].head(50), use_container_width=True, hide_index=True)
+
+    st.markdown("#### Saved / Resolved Paths")
+    paths_df = pd.DataFrame([
+        {"Artifact": "XGB Artifacts Path", "Value": str(cfg["xgb_artifacts_path"])},
+        {"Artifact": "LSTM Artifacts Path", "Value": str(cfg["lstm_artifacts_path"])},
+        {"Artifact": "RL Agent Path", "Value": str(cfg["rl_agent_path"])},
     ])
     st.dataframe(paths_df, use_container_width=True, hide_index=True)
 
@@ -260,6 +457,12 @@ if "lstm_eval_results" not in st.session_state:
 
 if "xgb_eval_results" not in st.session_state:
     st.session_state.xgb_eval_results = None
+
+if "ensemble_eval_results" not in st.session_state:
+    st.session_state.ensemble_eval_results = None
+
+if "rl_eval_results" not in st.session_state:
+    st.session_state.rl_eval_results = None
 
 st.title("Model Evaluation Lab")
 
@@ -310,7 +513,7 @@ with st.expander("Global Evaluation Settings", expanded=True):
     with r2c4:
         st.session_state.use_latest_data = st.checkbox(
             "Use latest available data",
-            value=st.session_state.use_latest_data
+            value=st.session_state.use_latest_data,
         )
 
 st.divider()
@@ -479,7 +682,6 @@ with st.expander("LSTM Evaluation", expanded=True):
         st.info("Use Retrain LSTM to train and save results, or Evaluate LSTM to load saved results.")
 
 
-
 with st.expander("XGBoost Evaluation", expanded=False):
     st.subheader("XGBoost Parameters")
 
@@ -545,6 +747,7 @@ with st.expander("XGBoost Evaluation", expanded=False):
                 step=0.01,
                 format="%.2f",
             )
+
         is_sentiment_available = (coin.upper() == "BTCUSDT" and frequency == "1h")
 
         with r2c4:
@@ -571,13 +774,535 @@ with st.expander("XGBoost Evaluation", expanded=False):
         with b2:
             evaluate_xgb_clicked = st.form_submit_button("Evaluate XGBoost", use_container_width=True)
 
+    xgb_save_paths = build_xgb_save_paths(coin, frequency)
+
+    if retrain_xgb_clicked:
+        try:
+            with st.spinner("Retraining XGBoost..."):
+                output_df = train_xgb_model(
+                    symbol=coin,
+                    resolution=frequency,
+                    start_date=start_date.isoformat(),
+                    end_date=end_date.isoformat() if isinstance(end_date, date) else None,
+                    train_ratio=0.80,
+                    n_estimators=int(n_estimators),
+                    learning_rate=float(learning_rate_xgb),
+                    max_depth=int(max_depth),
+                    subsample=float(subsample),
+                    colsample_bytree=float(colsample_bytree),
+                    decision_boundary=float(decision_boundary),
+                    margin_threshold=float(margin_threshold),
+                    artifacts_path=xgb_save_paths["artifacts_path"],
+                    preds_csv_path=xgb_save_paths["preds_csv_path"],
+                    use_sentiment_data=bool(use_sentiment_data),
+                )
+
+                xgb_summary = build_xgb_eval_summary(
+                    y_true=output_df["y_true"].values.astype(int),
+                    p_up=output_df["p_up"].values.astype(float),
+                    decision_boundary=float(decision_boundary),
+                    margin_threshold=float(margin_threshold),
+                )
+
+                margin_sweep_df = build_xgb_margin_sweep(
+                    y_true=output_df["y_true"].values.astype(int),
+                    p_up=output_df["p_up"].values.astype(float),
+                    decision_boundary=float(decision_boundary),
+                )
+
+                st.session_state.xgb_eval_results = {
+                    "output_df": output_df,
+                    "save_paths": xgb_save_paths,
+                    "xgb_summary": xgb_summary,
+                    "margin_sweep_df": margin_sweep_df,
+                    "chosen_margin": float(margin_threshold),
+                    "chosen_boundary": float(decision_boundary),
+                }
+
+            st.success("XGBoost retraining and evaluation completed successfully.")
+
+        except Exception as e:
+            st.error(f"XGBoost retraining failed: {e}")
+
+    if evaluate_xgb_clicked:
+        try:
+            preds_path = Path(xgb_save_paths["preds_csv_path"])
+            artifacts_path = Path(xgb_save_paths["artifacts_path"])
+
+            if not preds_path.exists() or not artifacts_path.exists():
+                st.error("Saved XGBoost evaluation files were not found. Retrain the model first.")
+            else:
+                output_df = pd.read_csv(preds_path)
+
+                xgb_summary = build_xgb_eval_summary(
+                    y_true=output_df["y_true"].values.astype(int),
+                    p_up=output_df["p_up"].values.astype(float),
+                    decision_boundary=float(decision_boundary),
+                    margin_threshold=float(margin_threshold),
+                )
+
+                margin_sweep_df = build_xgb_margin_sweep(
+                    y_true=output_df["y_true"].values.astype(int),
+                    p_up=output_df["p_up"].values.astype(float),
+                    decision_boundary=float(decision_boundary),
+                )
+
+                st.session_state.xgb_eval_results = {
+                    "output_df": output_df,
+                    "save_paths": xgb_save_paths,
+                    "xgb_summary": xgb_summary,
+                    "margin_sweep_df": margin_sweep_df,
+                    "chosen_margin": float(margin_threshold),
+                    "chosen_boundary": float(decision_boundary),
+                }
+
+                st.success("Loaded saved XGBoost evaluation results.")
+
+        except Exception as e:
+            st.error(f"XGBoost evaluation failed: {e}")
+
+    if st.session_state.xgb_eval_results is not None:
+        render_xgb_results(st.session_state.xgb_eval_results)
+    else:
+        st.info("Use Retrain XGBoost to train and save results, or Evaluate XGBoost to load saved results.")
+
 st.divider()
 
-with st.expander("LSTM + XGBoost Ensemble Evaluation"):
-    st.write("Ensemble evaluation controls and outputs will go here.")
+with st.expander("LSTM + XGBoost Ensemble Evaluation", expanded=False):
+    st.subheader("Ensemble Parameters")
 
-with st.expander("Ensemble + RL Filtering (Main Model)"):
-    st.write("Main model evaluation controls and outputs will go here.")
+    lstm_paths_ensemble = build_lstm_save_paths(coin, frequency)
+    xgb_paths_ensemble = build_xgb_save_paths(coin, frequency)
+
+    with st.form("ensemble_eval_form"):
+        r1c1, r1c2, r1c3, r1c4 = st.columns(4)
+
+        with r1c1:
+            ensemble_weight_xgb = st.number_input(
+                "ensemble_weight_xgb",
+                min_value=0.00,
+                max_value=1.00,
+                value=0.80,
+                step=0.05,
+                format="%.2f",
+            )
+
+        with r1c2:
+            ensemble_weight_lstm = st.number_input(
+                "ensemble_weight_lstm",
+                min_value=0.00,
+                max_value=1.00,
+                value=0.20,
+                step=0.05,
+                format="%.2f",
+            )
+
+        with r1c3:
+            ensemble_upper = st.number_input(
+                "ensemble_upper",
+                min_value=0.50,
+                max_value=0.99,
+                value=0.60,
+                step=0.01,
+                format="%.2f",
+            )
+
+        with r1c4:
+            ensemble_lower = st.number_input(
+                "ensemble_lower",
+                min_value=0.01,
+                max_value=0.50,
+                value=0.40,
+                step=0.01,
+                format="%.2f",
+            )
+
+        r2c1, r2c2, r2c3, r2c4 = st.columns(4)
+
+        with r2c1:
+            lstm_threshold_ensemble = st.number_input(
+                "lstm_threshold",
+                min_value=0.01,
+                max_value=0.99,
+                value=0.53,
+                step=0.01,
+                format="%.2f",
+            )
+
+        with r2c2:
+            max_horizon_ensemble = st.number_input(
+                "max_horizon",
+                min_value=1,
+                value=3,
+                step=1,
+            )
+
+        with r2c3:
+            fee_bps_ensemble = st.number_input(
+                "fee_bps",
+                min_value=0.0,
+                value=2.0,
+                step=0.5,
+                format="%.1f",
+            )
+
+        with r2c4:
+            trade_penalty_bps_ensemble = st.number_input(
+                "trade_penalty_bps",
+                min_value=0.0,
+                value=2.0,
+                step=0.5,
+                format="%.1f",
+            )
+
+        st.caption(
+            "This section does not retrain models. It evaluates the saved LSTM and XGBoost artifacts "
+            "for the currently selected coin/frequency combination."
+        )
+
+        st.caption(
+            f"LSTM artifacts: {lstm_paths_ensemble['artifacts_path']}  |  "
+            f"XGBoost artifacts: {xgb_paths_ensemble['artifacts_path']}"
+        )
+
+        evaluate_ensemble_clicked = st.form_submit_button(
+            "Evaluate Ensemble",
+            use_container_width=True,
+        )
+
+    if evaluate_ensemble_clicked:
+        try:
+            if ensemble_lower >= ensemble_upper:
+                st.error("ensemble_lower must be smaller than ensemble_upper.")
+            elif (ensemble_weight_xgb + ensemble_weight_lstm) <= 0:
+                st.error("At least one ensemble weight must be greater than zero.")
+            elif not Path(lstm_paths_ensemble["artifacts_path"]).exists():
+                st.error(
+                    f"LSTM artifacts not found for {coin} {frequency}. "
+                    "Train/evaluate LSTM first for this combination."
+                )
+            elif not Path(xgb_paths_ensemble["artifacts_path"]).exists():
+                st.error(
+                    f"XGBoost artifacts not found for {coin} {frequency}. "
+                    "Train/evaluate XGBoost first for this combination."
+                )
+            else:
+                with st.spinner("Evaluating ensemble..."):
+                    result = evaluate_ensemble_only(
+                        symbol=coin,
+                        resolution=frequency,
+                        start_date=start_date.isoformat(),
+                        end_date=end_date.isoformat() if isinstance(end_date, date) else None,
+                        train_ratio=0.80,
+                        xgb_artifacts_path=str(xgb_paths_ensemble["artifacts_path"]),
+                        lstm_artifacts_path=str(lstm_paths_ensemble["artifacts_path"]),
+                        lstm_threshold=float(lstm_threshold_ensemble),
+                        risk=RiskConfig(
+                            capital_usd=5000.0,
+                            risk_per_trade=0.02,
+                            rr=1.25,
+                            leverage=25.0,
+                            fee_bps=float(fee_bps_ensemble),
+                            trade_penalty_bps=float(trade_penalty_bps_ensemble),
+                            sl_atr_mult=1.0,
+                            min_atr_pct=0.001,
+                        ),
+                        ensemble_weight_xgb=float(ensemble_weight_xgb),
+                        ensemble_weight_lstm=float(ensemble_weight_lstm),
+                        ensemble_upper=float(ensemble_upper),
+                        ensemble_lower=float(ensemble_lower),
+                        max_horizon=int(max_horizon_ensemble),
+                        verbose=False,
+                    )
+
+                    st.session_state.ensemble_eval_results = result
+
+                st.success("Ensemble evaluation completed successfully.")
+
+        except Exception as e:
+            st.error(f"Ensemble evaluation failed: {e}")
+
+    if st.session_state.ensemble_eval_results is not None:
+        render_ensemble_results(st.session_state.ensemble_eval_results)
+    else:
+        st.info(
+            "This evaluates already-saved LSTM and XGBoost artifacts for the current coin/frequency combination."
+        )
+
+with st.expander("Ensemble + RL Filtering (Main Model)", expanded=False):
+    st.subheader("Ensemble + RL Parameters")
+
+    rl_combo_paths = build_combo_artifact_paths(coin, frequency)
+
+    with st.form("rl_eval_form"):
+        r1c1, r1c2, r1c3, r1c4 = st.columns(4)
+
+        with r1c1:
+            rl_ensemble_weight_xgb = st.number_input(
+                "rl_ensemble_weight_xgb",
+                min_value=0.00,
+                max_value=1.00,
+                value=0.80,
+                step=0.05,
+                format="%.2f",
+            )
+
+        with r1c2:
+            rl_ensemble_weight_lstm = st.number_input(
+                "rl_ensemble_weight_lstm",
+                min_value=0.00,
+                max_value=1.00,
+                value=0.20,
+                step=0.05,
+                format="%.2f",
+            )
+
+        with r1c3:
+            rl_ensemble_upper = st.number_input(
+                "rl_ensemble_upper",
+                min_value=0.50,
+                max_value=0.99,
+                value=0.60,
+                step=0.01,
+                format="%.2f",
+            )
+
+        with r1c4:
+            rl_ensemble_lower = st.number_input(
+                "rl_ensemble_lower",
+                min_value=0.01,
+                max_value=0.50,
+                value=0.40,
+                step=0.01,
+                format="%.2f",
+            )
+
+        r2c1, r2c2, r2c3, r2c4 = st.columns(4)
+
+        with r2c1:
+            rl_lstm_threshold = st.number_input(
+                "rl_lstm_threshold",
+                min_value=0.01,
+                max_value=0.99,
+                value=0.53,
+                step=0.01,
+                format="%.2f",
+            )
+
+        with r2c2:
+            rl_max_horizon = st.number_input(
+                "rl_max_horizon",
+                min_value=1,
+                value=3,
+                step=1,
+            )
+
+        with r2c3:
+            rl_alpha = st.number_input(
+                "alpha",
+                min_value=0.001,
+                max_value=1.0,
+                value=0.20,
+                step=0.01,
+                format="%.3f",
+            )
+
+        with r2c4:
+            rl_gamma = st.number_input(
+                "gamma",
+                min_value=0.00,
+                max_value=0.999,
+                value=0.95,
+                step=0.01,
+                format="%.2f",
+            )
+
+        r3c1, r3c2, r3c3, r3c4 = st.columns(4)
+
+        with r3c1:
+            rl_eps = st.number_input(
+                "eps",
+                min_value=0.00,
+                max_value=1.00,
+                value=0.25,
+                step=0.01,
+                format="%.2f",
+            )
+
+        with r3c2:
+            rl_episodes = st.number_input(
+                "episodes",
+                min_value=1,
+                value=60,
+                step=1,
+            )
+
+        with r3c3:
+            rl_min_take_visits = st.number_input(
+                "min_take_visits",
+                min_value=0,
+                value=20,
+                step=1,
+            )
+
+        with r3c4:
+            rl_q_take_margin = st.number_input(
+                "q_take_margin",
+                min_value=0.00,
+                value=0.20,
+                step=0.01,
+                format="%.2f",
+            )
+
+        r4c1, r4c2, r4c3, r4c4 = st.columns(4)
+
+        with r4c1:
+            rl_skip_reward_scale = st.number_input(
+                "skip_reward_scale",
+                min_value=0.00,
+                value=0.15,
+                step=0.01,
+                format="%.2f",
+            )
+
+        st.caption(
+            "This section uses the saved LSTM and XGBoost artifacts for the selected coin/frequency, "
+            "then trains or evaluates the RL trade filter on top of the ensemble."
+        )
+
+        st.caption(
+            "Risk settings are fixed to the default experimental configuration: "
+            "capital=5000, risk_per_trade=0.02, rr=1.25, leverage=25, fee_bps=2, "
+            "trade_penalty_bps=2, sl_atr_mult=1.0, min_atr_pct=0.001."
+        )
+
+        st.caption(
+            f"LSTM artifacts: {rl_combo_paths['lstm_artifacts_path']}  |  "
+            f"XGBoost artifacts: {rl_combo_paths['xgb_artifacts_path']}  |  "
+            f"RL agent: {rl_combo_paths['rl_agent_path']}"
+        )
+
+        b1, b2 = st.columns(2)
+        with b1:
+            train_rl_clicked = st.form_submit_button("Train RL Filter", use_container_width=True)
+        with b2:
+            eval_rl_clicked = st.form_submit_button("Evaluate RL Filter", use_container_width=True)
+
+    rl_risk = RiskConfig(
+        capital_usd=5000.0,
+        risk_per_trade=0.02,
+        rr=1.25,
+        leverage=25.0,
+        fee_bps=2.0,
+        trade_penalty_bps=2.0,
+        sl_atr_mult=1.0,
+        min_atr_pct=0.001,
+    )
+
+    if train_rl_clicked:
+        try:
+            if rl_ensemble_lower >= rl_ensemble_upper:
+                st.error("rl_ensemble_lower must be smaller than rl_ensemble_upper.")
+            elif (rl_ensemble_weight_xgb + rl_ensemble_weight_lstm) <= 0:
+                st.error("At least one RL ensemble weight must be greater than zero.")
+            elif not Path(rl_combo_paths["lstm_artifacts_path"]).exists():
+                st.error(
+                    f"LSTM artifacts not found for {coin} {frequency}. "
+                    "Train/evaluate LSTM first for this combination."
+                )
+            elif not Path(rl_combo_paths["xgb_artifacts_path"]).exists():
+                st.error(
+                    f"XGBoost artifacts not found for {coin} {frequency}. "
+                    "Train/evaluate XGBoost first for this combination."
+                )
+            else:
+                with st.spinner("Training RL filter..."):
+                    train_rl_policy(
+                        symbol=coin,
+                        resolution=frequency,
+                        start_date=start_date.isoformat(),
+                        end_date=end_date.isoformat() if isinstance(end_date, date) else None,
+                        train_ratio=0.80,
+                        xgb_artifacts_path=str(rl_combo_paths["xgb_artifacts_path"]),
+                        lstm_artifacts_path=str(rl_combo_paths["lstm_artifacts_path"]),
+                        lstm_threshold=float(rl_lstm_threshold),
+                        agent_out_path=str(rl_combo_paths["rl_agent_path"]),
+                        alpha=float(rl_alpha),
+                        gamma=float(rl_gamma),
+                        eps=float(rl_eps),
+                        episodes=int(rl_episodes),
+                        risk=rl_risk,
+                        ensemble_weight_xgb=float(rl_ensemble_weight_xgb),
+                        ensemble_weight_lstm=float(rl_ensemble_weight_lstm),
+                        ensemble_upper=float(rl_ensemble_upper),
+                        ensemble_lower=float(rl_ensemble_lower),
+                        max_horizon=int(rl_max_horizon),
+                        skip_reward_scale=float(rl_skip_reward_scale),
+                    )
+
+                st.success("RL filter training completed successfully.")
+
+        except Exception as e:
+            st.error(f"RL training failed: {e}")
+
+    if eval_rl_clicked:
+        try:
+            if rl_ensemble_lower >= rl_ensemble_upper:
+                st.error("rl_ensemble_lower must be smaller than rl_ensemble_upper.")
+            elif (rl_ensemble_weight_xgb + rl_ensemble_weight_lstm) <= 0:
+                st.error("At least one RL ensemble weight must be greater than zero.")
+            elif not Path(rl_combo_paths["lstm_artifacts_path"]).exists():
+                st.error(
+                    f"LSTM artifacts not found for {coin} {frequency}. "
+                    "Train/evaluate LSTM first for this combination."
+                )
+            elif not Path(rl_combo_paths["xgb_artifacts_path"]).exists():
+                st.error(
+                    f"XGBoost artifacts not found for {coin} {frequency}. "
+                    "Train/evaluate XGBoost first for this combination."
+                )
+            elif not Path(rl_combo_paths["rl_agent_path"]).exists():
+                st.error(
+                    f"RL agent not found for {coin} {frequency}. "
+                    "Train the RL filter first for this combination."
+                )
+            else:
+                with st.spinner("Evaluating RL filter..."):
+                    result = evaluate_rl_agent(
+                        symbol=coin,
+                        resolution=frequency,
+                        start_date=start_date.isoformat(),
+                        end_date=end_date.isoformat() if isinstance(end_date, date) else None,
+                        train_ratio=0.80,
+                        xgb_artifacts_path=str(rl_combo_paths["xgb_artifacts_path"]),
+                        lstm_artifacts_path=str(rl_combo_paths["lstm_artifacts_path"]),
+                        lstm_threshold=float(rl_lstm_threshold),
+                        rl_agent_path=str(rl_combo_paths["rl_agent_path"]),
+                        risk=rl_risk,
+                        ensemble_weight_xgb=float(rl_ensemble_weight_xgb),
+                        ensemble_weight_lstm=float(rl_ensemble_weight_lstm),
+                        ensemble_upper=float(rl_ensemble_upper),
+                        ensemble_lower=float(rl_ensemble_lower),
+                        max_horizon=int(rl_max_horizon),
+                        min_take_visits=int(rl_min_take_visits),
+                        q_take_margin=float(rl_q_take_margin),
+                    )
+
+                    st.session_state.rl_eval_results = result
+
+                st.success("RL filter evaluation completed successfully.")
+
+        except Exception as e:
+            st.error(f"RL evaluation failed: {e}")
+
+    if st.session_state.rl_eval_results is not None:
+        render_rl_results(st.session_state.rl_eval_results)
+    else:
+        st.info(
+            "Use Train RL Filter to train and save the RL agent, or Evaluate RL Filter to evaluate a saved RL agent."
+        )
+
+st.divider()
 
 with st.expander("LSTM (Alternative Target)"):
     st.write("Alternative LSTM evaluation controls and outputs will go here.")
