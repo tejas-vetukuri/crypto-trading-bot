@@ -12,6 +12,8 @@ from joblib import dump, load
 
 from data.binance import BinanceDataClient
 from data.feature_engineering import feature_engineering_xgb
+from data.feature_engineering_bybit import feature_engineering_bybit
+from data.bybit_derivatives_features import merge_bybit_oi_lsr_features
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -70,44 +72,54 @@ def train_xgb_model(
     end_date: str | None = None,
     train_ratio: float = 0.80,
 
-    # Decision boundary (shift from 0.5 to fix skew)
     decision_boundary: float = 0.48,
+    margin_threshold: float = 0.10,
 
-    # Ignore zone around boundary
-    margin_threshold: float = 0.1,
-
-    # Leave tuned artifacts separate / unchanged
     tuned_artifacts_path: str | Path = "models/xgboost/xgb_tuned_artifacts.joblib",
 
     artifacts_path: str | Path | None = None,
     preds_csv_path: str | Path | None = None,
+
+    n_estimators: int | None = None,
+    learning_rate: float | None = None,
+    max_depth: int | None = None,
+    subsample: float | None = None,
+    colsample_bytree: float | None = None,
+    use_sentiment_data: bool = False,
 ):
     """
     XGBoost next-direction classifier with:
       - BinanceDataClient fetch
+      - Optional Bybit OI / LSR merge
       - Feature engineering
       - Chronological split
-      - Binary labels: down=0, up=1 (stable)
-      - Decision boundary shift + optional ignore zone
-      - Loads tuned hyperparameters from tuned_artifacts_path (best_params)
+      - Binary labels: down=0, up=1
+      - Decision boundary + ignore zone
+      - Loads tuned hyperparameters from tuned_artifacts_path by default
+      - Allows manual hyperparameter overrides from the evaluation lab
       - Saves combination-specific artifacts/predictions
-
-    Save naming example for BTCUSDT, 5m:
-      - models/xgboost/saved/xgb_artifacts_BTC_5m.joblib
-      - models/xgboost/saved/xgb_predictions_BTC_5m.csv
 
     Returns:
       model, artifacts, output_df
     """
     symbol = symbol.upper()
+
     if start_date is None:
         start_date = get_default_start_date(resolution)
 
     default_paths = build_xgb_save_paths(symbol, resolution)
 
     tuned_artifacts_path_p = resolve_project_path(tuned_artifacts_path)
-    artifacts_path_p = resolve_project_path(artifacts_path) if artifacts_path else default_paths["artifacts_path"]
-    preds_csv_path_p = resolve_project_path(preds_csv_path) if preds_csv_path else default_paths["preds_csv_path"]
+    artifacts_path_p = (
+        resolve_project_path(artifacts_path)
+        if artifacts_path is not None
+        else default_paths["artifacts_path"]
+    )
+    preds_csv_path_p = (
+        resolve_project_path(preds_csv_path)
+        if preds_csv_path is not None
+        else default_paths["preds_csv_path"]
+    )
 
     for p in [artifacts_path_p, preds_csv_path_p]:
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -120,6 +132,7 @@ def train_xgb_model(
     print(f"Train ratio:       {train_ratio}")
     print(f"Decision boundary: {decision_boundary}")
     print(f"Margin threshold:  {margin_threshold}")
+    print(f"Use sentiment:     {use_sentiment_data}")
     print(f"Combo tag:         {combo_tag(symbol, resolution)}")
     print(f"Tuned artifacts:   {tuned_artifacts_path_p}")
     print("==================================================\n")
@@ -136,14 +149,27 @@ def train_xgb_model(
     )
 
     df = df.sort_values("timestamp").reset_index(drop=True)
+
     if df.empty:
         raise ValueError("No candle data returned.")
 
     # -----------------------------
-    # 2) Chronological split
+    # 2) Optional Bybit merge
+    # -----------------------------
+    if use_sentiment_data:
+        df = merge_bybit_oi_lsr_features(
+            price_df=df,
+            symbol=symbol,
+            start_date=start_date,
+            end_date=end_date,
+        )
+
+    # -----------------------------
+    # 3) Chronological split
     # -----------------------------
     n = len(df)
     train_end = int(n * train_ratio)
+
     if train_end <= 0 or train_end >= n:
         raise ValueError(f"Invalid split. n={n}, train_end={train_end}")
 
@@ -151,8 +177,12 @@ def train_xgb_model(
     test_df = df.iloc[train_end:].copy()
 
     # -----------------------------
-    # 3) Feature engineering
+    # 4) Feature engineering
     # -----------------------------
+    if use_sentiment_data:
+        train_df = feature_engineering_bybit(train_df)
+        test_df = feature_engineering_bybit(test_df)
+
     train_df = feature_engineering_xgb(train_df)
     test_df = feature_engineering_xgb(test_df)
 
@@ -165,6 +195,9 @@ def train_xgb_model(
         "volatility_5", "vol_10", "vol_30", "vol_ratio",
         "vol_chg_1", "vol_chg_5", "vol_z20",
     ]
+
+    if use_sentiment_data:
+        features += ["oi_change", "oi_z", "lsr_z"]
 
     missing_train = [c for c in features + ["actual_trend"] if c not in train_df.columns]
     missing_test = [c for c in features + ["actual_trend"] if c not in test_df.columns]
@@ -187,19 +220,19 @@ def train_xgb_model(
     y_test = test_df["actual_trend"].astype(str)
 
     # -----------------------------
-    # 4) Encode labels
+    # 5) Encode labels
     # -----------------------------
-    # Stable mapping for XGB: up=1, down=0
     y_train_bin = (y_train.values == "up").astype(int)
     y_test_bin = (y_test.values == "up").astype(int)
 
     le = LabelEncoder()
     le.fit(y_train)
+
     if "up" not in le.classes_ or "down" not in le.classes_:
         raise ValueError(f"Expected classes to include 'up' and 'down', got {list(le.classes_)}")
 
     # -----------------------------
-    # 5) Load tuned hyperparameters
+    # 6) Load tuned hyperparameters
     # -----------------------------
     best_params = None
     try:
@@ -214,7 +247,7 @@ def train_xgb_model(
         print("⚠️ Using default XGB params.")
 
     # -----------------------------
-    # 6) Train model
+    # 7) Train model
     # -----------------------------
     default_params = dict(
         objective="binary:logistic",
@@ -228,15 +261,36 @@ def train_xgb_model(
         tree_method="hist",
     )
 
-    model_params = {**default_params, **best_params} if isinstance(best_params, dict) else default_params
+    model_params = (
+        {**default_params, **best_params}
+        if isinstance(best_params, dict)
+        else default_params.copy()
+    )
+
+    if n_estimators is not None:
+        model_params["n_estimators"] = int(n_estimators)
+    if learning_rate is not None:
+        model_params["learning_rate"] = float(learning_rate)
+    if max_depth is not None:
+        model_params["max_depth"] = int(max_depth)
+    if subsample is not None:
+        model_params["subsample"] = float(subsample)
+    if colsample_bytree is not None:
+        model_params["colsample_bytree"] = float(colsample_bytree)
+
     model_params["objective"] = "binary:logistic"
     model_params["eval_metric"] = "logloss"
+
+    print("\n================ XGB PARAMS USED =================")
+    for k, v in model_params.items():
+        print(f"{k}: {v}")
+    print("==================================================\n")
 
     model = XGBClassifier(**model_params)
     model.fit(X_train, y_train_bin)
 
     # -----------------------------
-    # 7) Predict + decision boundary
+    # 8) Predict + decision boundary
     # -----------------------------
     if not (0.0 < decision_boundary < 1.0):
         raise ValueError(f"decision_boundary must be in (0, 1). Got {decision_boundary}")
@@ -249,21 +303,21 @@ def train_xgb_model(
 
     margin = np.abs(p_up - decision_boundary)
 
-    final_preds = np.full(len(p_up), 2, dtype=int)  # 2 = sideways
+    final_preds = np.full(len(p_up), 2, dtype=int)
     confident = margin >= margin_threshold
-    final_preds[confident] = (p_up[confident] > decision_boundary).astype(int)  # 1=up, 0=down
+    final_preds[confident] = (p_up[confident] > decision_boundary).astype(int)
 
     probability_for_pred = np.where(final_preds == 2, decision_boundary, p_up)
 
     # -----------------------------
-    # 8) Save predictions
+    # 9) Save predictions
     # -----------------------------
     output_df = pd.DataFrame({
         "timestamp": test_df["timestamp"].values,
         "symbol": symbol,
         "resolution": resolution,
-        "prediction": final_preds,             # 0/1 or 2(sideways)
-        "actual_trend": y_test.values,         # "down"/"up"
+        "prediction": final_preds,
+        "actual_trend": y_test.values,
         "p_up": p_up,
         "decision_boundary": float(decision_boundary),
         "margin": margin,
@@ -275,7 +329,7 @@ def train_xgb_model(
     print(f"✅ Predictions saved to {preds_csv_path_p}")
 
     # -----------------------------
-    # 9) Used-trade evaluation
+    # 10) Used-trade evaluation
     # -----------------------------
     mask = final_preds != 2
     filtered_preds = final_preds[mask]
@@ -291,7 +345,8 @@ def train_xgb_model(
         print("\n⚠️ No predictions passed the margin threshold.")
 
     sideways_count = int((final_preds == 2).sum())
-    sideways_pct = (sideways_count / len(final_preds)) * 100
+    sideways_pct = (sideways_count / len(final_preds)) * 100 if len(final_preds) else 0.0
+
     print(f"\n➡️ Sideways count: {sideways_count} ({sideways_pct:.2f}%)")
     print(f"➡️ Decision boundary: {decision_boundary}")
     print(f"➡️ Margin threshold: {margin_threshold}")
@@ -301,14 +356,25 @@ def train_xgb_model(
     print(f"Test  UP rate: {float(y_test_bin.mean()):.4f}")
 
     # -----------------------------
-    # 10) Save artifacts
+    # 11) Save artifacts
     # -----------------------------
+    try:
+        tuned_artifacts_rel = str(tuned_artifacts_path_p.relative_to(PROJECT_ROOT))
+    except ValueError:
+        tuned_artifacts_rel = str(tuned_artifacts_path_p)
+
+    try:
+        preds_csv_rel = str(preds_csv_path_p.relative_to(PROJECT_ROOT))
+    except ValueError:
+        preds_csv_rel = str(preds_csv_path_p)
+
     artifacts = {
         "model": model,
         "label_encoder": le,
         "features": features,
         "decision_boundary": float(decision_boundary),
         "margin_threshold": float(margin_threshold),
+        "use_sentiment_data": bool(use_sentiment_data),
         "symbol": symbol,
         "symbol_tag": symbol_tag(symbol),
         "resolution": resolution,
@@ -319,8 +385,8 @@ def train_xgb_model(
         "train_ratio": float(train_ratio),
         "ignore_zone": f"sideways if |p_up-{decision_boundary}| < {margin_threshold}",
         "best_params_used": model_params,
-        "tuned_artifacts_path": str(tuned_artifacts_path_p.relative_to(PROJECT_ROOT)),
-        "preds_csv_path": str(preds_csv_path_p.relative_to(PROJECT_ROOT)),
+        "tuned_artifacts_path": tuned_artifacts_rel,
+        "preds_csv_path": preds_csv_rel,
     }
 
     dump(artifacts, str(artifacts_path_p))

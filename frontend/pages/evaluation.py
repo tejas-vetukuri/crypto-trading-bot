@@ -15,6 +15,15 @@ from models.lstm.train_eval_lstm import (
     build_threshold_summary,
     build_distribution_tables,
 )
+from models.xgboost.xgb import (
+    train_xgb_model,
+    build_xgb_save_paths,
+)
+from models.xgboost.train_eval_xgb import (
+    build_xgb_eval_summary,
+    build_xgb_margin_sweep,
+    build_xgb_distribution_tables,
+)
 
 
 st.set_page_config(page_title="Model Evaluation Lab", layout="wide")
@@ -132,6 +141,114 @@ def render_lstm_results(results: dict):
     st.dataframe(paths_df, use_container_width=True, hide_index=True)
 
 
+def render_xgb_results(results: dict):
+    output_df = results["output_df"]
+    save_paths = results["save_paths"]
+    xgb_summary = results["xgb_summary"]
+    margin_sweep_df = results["margin_sweep_df"]
+    chosen_margin = results["chosen_margin"]
+    chosen_boundary = results["chosen_boundary"]
+
+    y_true = output_df["y_true"].values.astype(int)
+    p_up = output_df["p_up"].values.astype(float)
+
+    auc_val = safe_auc(y_true, p_up)
+
+    st.markdown("### Results")
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("ROC-AUC", f"{auc_val:.4f}" if auc_val is not None else "—")
+    c2.metric(f"Coverage @ Margin {chosen_margin:.2f}", f"{xgb_summary['coverage']:.4f}")
+    c3.metric("Used Accuracy", "—" if xgb_summary["used_accuracy"] is None else f"{xgb_summary['used_accuracy']:.4f}")
+    c4.metric("Ignored Rate", f"{xgb_summary['ignored_rate']:.4f}")
+
+    summary_df = pd.DataFrame([
+        {"Metric": "Decision Boundary", "Value": f"{chosen_boundary:.2f}"},
+        {"Metric": "Margin Threshold", "Value": f"{chosen_margin:.2f}"},
+        {"Metric": "Coverage", "Value": f"{xgb_summary['coverage']:.4f}"},
+        {"Metric": "Ignored Rate", "Value": f"{xgb_summary['ignored_rate']:.4f}"},
+        {"Metric": "Used Samples", "Value": xgb_summary["used_samples"]},
+        {"Metric": "Total Samples", "Value": xgb_summary["total_samples"]},
+        {
+            "Metric": "Used Accuracy",
+            "Value": "—" if xgb_summary["used_accuracy"] is None else f"{xgb_summary['used_accuracy']:.4f}",
+        },
+        {
+            "Metric": "Random Baseline Accuracy",
+            "Value": "—" if xgb_summary["random_baseline_accuracy"] is None else f"{xgb_summary['random_baseline_accuracy']:.4f}",
+        },
+        {
+            "Metric": "Majority Baseline Accuracy",
+            "Value": "—" if xgb_summary["majority_baseline_accuracy"] is None else f"{xgb_summary['majority_baseline_accuracy']:.4f}",
+        },
+    ])
+
+    st.markdown("#### Margin Evaluation Summary")
+    st.dataframe(summary_df, use_container_width=True, hide_index=True)
+
+    st.markdown("#### Margin Sweep Metrics")
+    st.dataframe(margin_sweep_df, use_container_width=True, hide_index=True)
+
+    st.markdown("#### Confusion Matrix")
+    if xgb_summary["confusion_matrix"] is None:
+        st.warning("No samples were used at this margin threshold.")
+    else:
+        cm_df = pd.DataFrame(
+            xgb_summary["confusion_matrix"],
+            index=["Actual DOWN", "Actual UP"],
+            columns=["Pred DOWN", "Pred UP"],
+        )
+        st.dataframe(cm_df, use_container_width=True)
+
+    st.markdown("#### Classification Report")
+    if xgb_summary["classification_report_df"] is None:
+        st.warning("No classification report available for this margin threshold.")
+    else:
+        st.dataframe(
+            xgb_summary["classification_report_df"],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    st.markdown("#### Sample Distribution")
+    actual_full, actual_used, pred_used_df = build_xgb_distribution_tables(
+        y_true=y_true,
+        used_mask=xgb_summary["used_mask"],
+        pred_used=xgb_summary["pred_used"],
+    )
+
+    d1, d2, d3 = st.columns(3)
+    with d1:
+        st.markdown("**Actual Class Distribution (Full Test)**")
+        st.dataframe(actual_full, use_container_width=True, hide_index=True)
+    with d2:
+        st.markdown("**Actual Class Distribution (Used Only)**")
+        st.dataframe(actual_used, use_container_width=True, hide_index=True)
+    with d3:
+        st.markdown("**Predicted Class Distribution (Used Only)**")
+        st.dataframe(pred_used_df, use_container_width=True, hide_index=True)
+
+    st.markdown("#### Test Predictions Preview")
+    preview_cols = [
+        "timestamp",
+        "actual_trend",
+        "prediction",
+        "p_up",
+        "decision_boundary",
+        "margin",
+        "used",
+        "probability",
+    ]
+    st.dataframe(output_df[preview_cols].head(50), use_container_width=True, hide_index=True)
+
+    st.markdown("#### Saved Artifacts")
+    paths_df = pd.DataFrame([
+        {"Artifact": "Artifacts Path", "Value": str(save_paths["artifacts_path"])},
+        {"Artifact": "Predictions CSV Path", "Value": str(save_paths["preds_csv_path"])},
+    ])
+    st.dataframe(paths_df, use_container_width=True, hide_index=True)
+
+
 if "coin" not in st.session_state:
     st.session_state.coin = "BTCUSDT"
 
@@ -140,6 +257,9 @@ if "interval" not in st.session_state:
 
 if "lstm_eval_results" not in st.session_state:
     st.session_state.lstm_eval_results = None
+
+if "xgb_eval_results" not in st.session_state:
+    st.session_state.xgb_eval_results = None
 
 st.title("Model Evaluation Lab")
 
@@ -185,7 +305,6 @@ with st.expander("Global Evaluation Settings", expanded=True):
     with r1c5:
         st.text_input("Train/Test Split", value="80/20", disabled=True)
 
-    # Second row — clean placement
     r2c1, r2c2, r2c3, r2c4, r2c5 = st.columns(5)
 
     with r2c4:
@@ -359,10 +478,100 @@ with st.expander("LSTM Evaluation", expanded=True):
     else:
         st.info("Use Retrain LSTM to train and save results, or Evaluate LSTM to load saved results.")
 
-st.divider()
 
-with st.expander("XGBoost Evaluation"):
-    st.write("XGBoost model evaluation controls and outputs will go here.")
+
+with st.expander("XGBoost Evaluation", expanded=False):
+    st.subheader("XGBoost Parameters")
+
+    with st.form("xgb_eval_form"):
+        r1c1, r1c2, r1c3, r1c4 = st.columns(4)
+        with r1c1:
+            n_estimators = st.number_input(
+                "n_estimators",
+                min_value=10,
+                value=300,
+                step=10,
+            )
+        with r1c2:
+            learning_rate_xgb = st.number_input(
+                "learning_rate",
+                min_value=0.001,
+                value=0.05,
+                step=0.001,
+                format="%.3f",
+            )
+        with r1c3:
+            max_depth = st.number_input(
+                "max_depth",
+                min_value=1,
+                value=6,
+                step=1,
+            )
+        with r1c4:
+            subsample = st.number_input(
+                "subsample",
+                min_value=0.10,
+                max_value=1.00,
+                value=0.80,
+                step=0.05,
+                format="%.2f",
+            )
+
+        r2c1, r2c2, r2c3, r2c4 = st.columns(4)
+        with r2c1:
+            colsample_bytree = st.number_input(
+                "colsample_bytree",
+                min_value=0.10,
+                max_value=1.00,
+                value=0.80,
+                step=0.05,
+                format="%.2f",
+            )
+        with r2c2:
+            decision_boundary = st.number_input(
+                "decision_boundary",
+                min_value=0.01,
+                max_value=0.99,
+                value=0.48,
+                step=0.01,
+                format="%.2f",
+            )
+        with r2c3:
+            margin_threshold = st.number_input(
+                "margin_threshold",
+                min_value=0.00,
+                max_value=0.49,
+                value=0.10,
+                step=0.01,
+                format="%.2f",
+            )
+        is_sentiment_available = (coin.upper() == "BTCUSDT" and frequency == "1h")
+
+        with r2c4:
+            st.markdown("<div style='height: 8px'></div>", unsafe_allow_html=True)
+
+            use_sentiment_data = st.checkbox(
+                "use sentiment data",
+                value=False,
+                disabled=not is_sentiment_available,
+                help="Available only for BTC 1h. Adds Bybit derivatives features (OI + LSR).",
+            )
+
+            if not is_sentiment_available:
+                st.caption("Sentiment features currently supported only for BTC 1h experiments.")
+
+        st.caption(
+            "Note: Default parameters are set to the best-performing configuration identified "
+            "through prior grid search tuning on BTCUSDT 1h data."
+        )
+
+        b1, b2 = st.columns(2)
+        with b1:
+            retrain_xgb_clicked = st.form_submit_button("Retrain XGBoost", use_container_width=True)
+        with b2:
+            evaluate_xgb_clicked = st.form_submit_button("Evaluate XGBoost", use_container_width=True)
+
+st.divider()
 
 with st.expander("LSTM + XGBoost Ensemble Evaluation"):
     st.write("Ensemble evaluation controls and outputs will go here.")
