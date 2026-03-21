@@ -15,6 +15,7 @@ from models.lstm.train_eval_lstm import (
     build_threshold_summary,
     build_distribution_tables,
 )
+
 from models.xgboost.xgb import (
     train_xgb_model,
     build_xgb_save_paths,
@@ -24,6 +25,26 @@ from models.xgboost.train_eval_xgb import (
     build_xgb_margin_sweep,
     build_xgb_distribution_tables,
 )
+
+from models.baselines.randomforest import (
+    train_rf_model,
+    build_rf_save_paths,
+)
+from models.baselines.train_eval_rf import (
+    build_rf_eval_summary,
+    build_rf_margin_sweep,
+    build_rf_distribution_tables,
+)
+
+from models.baselines.simple_rnn import (
+    train_simple_rnn_model,
+    build_simple_rnn_save_paths,
+)
+from models.baselines.train_eval_rnn import (
+    build_threshold_summary as build_simple_rnn_threshold_summary,
+    build_distribution_tables as build_simple_rnn_distribution_tables,
+)
+
 from models.rl.eval_ensemble_only import evaluate_ensemble_only
 from models.rl.rl_ensemble import (
     RiskConfig,
@@ -148,6 +169,111 @@ def render_lstm_results(results: dict):
     st.dataframe(paths_df, use_container_width=True, hide_index=True)
 
 
+def render_simple_rnn_results(results: dict):
+    history = results.get("history")
+    probs_df = results["probs_df"]
+    metrics_df = results["metrics_df"]
+    save_paths = results["save_paths"]
+    threshold_summary = results["threshold_summary"]
+    chosen_threshold = results["chosen_threshold"]
+
+    y_true = probs_df["y_true"].values.astype(int)
+    probs = probs_df["p"].values.astype(float)
+
+    train_acc = None
+    val_acc = None
+    if history is not None:
+        train_acc = history.history.get("accuracy", [None])[-1]
+        val_acc = history.history.get("val_accuracy", [None])[-1]
+
+    auc_val = safe_auc(y_true, probs)
+
+    st.markdown("### Results")
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Train Accuracy", f"{train_acc:.4f}" if train_acc is not None else "—")
+    c2.metric("Validation Accuracy", f"{val_acc:.4f}" if val_acc is not None else "—")
+    c3.metric("ROC-AUC", f"{auc_val:.4f}" if auc_val is not None else "—")
+    c4.metric(f"Coverage @ {chosen_threshold:.2f}", f"{threshold_summary['coverage']:.4f}")
+
+    summary_df = pd.DataFrame([
+        {"Metric": "Threshold", "Value": f"{threshold_summary['threshold']:.2f}"},
+        {"Metric": "Coverage", "Value": f"{threshold_summary['coverage']:.4f}"},
+        {"Metric": "Ignored Rate", "Value": f"{threshold_summary['ignored_rate']:.4f}"},
+        {"Metric": "Used Samples", "Value": threshold_summary["used_samples"]},
+        {"Metric": "Total Samples", "Value": threshold_summary["total_samples"]},
+        {
+            "Metric": "Used Accuracy",
+            "Value": "—" if threshold_summary["used_accuracy"] is None else f"{threshold_summary['used_accuracy']:.4f}",
+        },
+        {
+            "Metric": "Random Baseline Accuracy",
+            "Value": "—" if threshold_summary["random_baseline_accuracy"] is None else f"{threshold_summary['random_baseline_accuracy']:.4f}",
+        },
+        {
+            "Metric": "Majority Baseline Accuracy",
+            "Value": "—" if threshold_summary["majority_baseline_accuracy"] is None else f"{threshold_summary['majority_baseline_accuracy']:.4f}",
+        },
+    ])
+
+    st.markdown("#### Threshold Evaluation Summary")
+    st.dataframe(summary_df, use_container_width=True, hide_index=True)
+
+    st.markdown("#### Threshold Sweep Metrics")
+    st.dataframe(metrics_df, use_container_width=True, hide_index=True)
+
+    st.markdown("#### Confusion Matrix")
+    if threshold_summary["confusion_matrix"] is None:
+        st.warning("No samples were used at this threshold.")
+    else:
+        cm_df = pd.DataFrame(
+            threshold_summary["confusion_matrix"],
+            index=["Actual DOWN", "Actual UP"],
+            columns=["Pred DOWN", "Pred UP"],
+        )
+        st.dataframe(cm_df, use_container_width=True)
+
+    st.markdown("#### Classification Report")
+    if threshold_summary["classification_report_df"] is None:
+        st.warning("No classification report available for this threshold.")
+    else:
+        st.dataframe(
+            threshold_summary["classification_report_df"],
+            use_container_width=True,
+        )
+
+    st.markdown("#### Sample Distribution")
+    actual_full, actual_used, pred_used_df = build_simple_rnn_distribution_tables(
+        y_true=y_true,
+        used_mask=threshold_summary["used_mask"],
+        pred_used=threshold_summary["pred_used"],
+    )
+
+    d1, d2, d3 = st.columns(3)
+    with d1:
+        st.markdown("**Actual Class Distribution (Full Test)**")
+        st.dataframe(actual_full, use_container_width=True, hide_index=True)
+    with d2:
+        st.markdown("**Actual Class Distribution (Used Only)**")
+        st.dataframe(actual_used, use_container_width=True, hide_index=True)
+    with d3:
+        st.markdown("**Predicted Class Distribution (Used Only)**")
+        st.dataframe(pred_used_df, use_container_width=True, hide_index=True)
+
+    st.markdown("#### Test Probabilities Preview")
+    st.dataframe(probs_df.head(50), use_container_width=True, hide_index=True)
+
+    st.markdown("#### Saved Artifacts")
+    paths_df = pd.DataFrame([
+        {"Artifact": "Model Path", "Value": str(save_paths["model_path"])},
+        {"Artifact": "Scaler Path", "Value": str(save_paths["scaler_path"])},
+        {"Artifact": "Artifacts Path", "Value": str(save_paths["artifacts_path"])},
+        {"Artifact": "Test Probs Path", "Value": str(save_paths["test_probs_path"])},
+        {"Artifact": "Metrics Path", "Value": str(save_paths["metrics_path"])},
+    ])
+    st.dataframe(paths_df, use_container_width=True, hide_index=True)
+
+
 def render_xgb_results(results: dict):
     output_df = results["output_df"]
     save_paths = results["save_paths"]
@@ -222,6 +348,115 @@ def render_xgb_results(results: dict):
         y_true=y_true,
         used_mask=xgb_summary["used_mask"],
         pred_used=xgb_summary["pred_used"],
+    )
+
+    d1, d2, d3 = st.columns(3)
+    with d1:
+        st.markdown("**Actual Class Distribution (Full Test)**")
+        st.dataframe(actual_full, use_container_width=True, hide_index=True)
+    with d2:
+        st.markdown("**Actual Class Distribution (Used Only)**")
+        st.dataframe(actual_used, use_container_width=True, hide_index=True)
+    with d3:
+        st.markdown("**Predicted Class Distribution (Used Only)**")
+        st.dataframe(pred_used_df, use_container_width=True, hide_index=True)
+
+    st.markdown("#### Test Predictions Preview")
+    preview_cols = [
+        "timestamp",
+        "actual_trend",
+        "prediction",
+        "p_up",
+        "decision_boundary",
+        "margin",
+        "used",
+        "probability",
+    ]
+    preview_cols = [c for c in preview_cols if c in output_df.columns]
+    st.dataframe(output_df[preview_cols].head(50), use_container_width=True, hide_index=True)
+
+    st.markdown("#### Saved Artifacts")
+    paths_df = pd.DataFrame([
+        {"Artifact": "Artifacts Path", "Value": str(save_paths["artifacts_path"])},
+        {"Artifact": "Predictions CSV Path", "Value": str(save_paths["preds_csv_path"])},
+    ])
+    st.dataframe(paths_df, use_container_width=True, hide_index=True)
+
+
+def render_rf_results(results: dict):
+    output_df = results["output_df"]
+    save_paths = results["save_paths"]
+    rf_summary = results["rf_summary"]
+    margin_sweep_df = results["margin_sweep_df"]
+    chosen_margin = results["chosen_margin"]
+    chosen_boundary = results["chosen_boundary"]
+
+    y_true = output_df["y_true"].values.astype(int)
+    p_up = output_df["p_up"].values.astype(float)
+
+    auc_val = safe_auc(y_true, p_up)
+
+    st.markdown("### Results")
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("ROC-AUC", f"{auc_val:.4f}" if auc_val is not None else "—")
+    c2.metric(f"Coverage @ Margin {chosen_margin:.2f}", f"{rf_summary['coverage']:.4f}")
+    c3.metric("Used Accuracy", "—" if rf_summary["used_accuracy"] is None else f"{rf_summary['used_accuracy']:.4f}")
+    c4.metric("Ignored Rate", f"{rf_summary['ignored_rate']:.4f}")
+
+    summary_df = pd.DataFrame([
+        {"Metric": "Decision Boundary", "Value": f"{chosen_boundary:.2f}"},
+        {"Metric": "Margin Threshold", "Value": f"{chosen_margin:.2f}"},
+        {"Metric": "Coverage", "Value": f"{rf_summary['coverage']:.4f}"},
+        {"Metric": "Ignored Rate", "Value": f"{rf_summary['ignored_rate']:.4f}"},
+        {"Metric": "Used Samples", "Value": rf_summary["used_samples"]},
+        {"Metric": "Total Samples", "Value": rf_summary["total_samples"]},
+        {
+            "Metric": "Used Accuracy",
+            "Value": "—" if rf_summary["used_accuracy"] is None else f"{rf_summary['used_accuracy']:.4f}",
+        },
+        {
+            "Metric": "Random Baseline Accuracy",
+            "Value": "—" if rf_summary["random_baseline_accuracy"] is None else f"{rf_summary['random_baseline_accuracy']:.4f}",
+        },
+        {
+            "Metric": "Majority Baseline Accuracy",
+            "Value": "—" if rf_summary["majority_baseline_accuracy"] is None else f"{rf_summary['majority_baseline_accuracy']:.4f}",
+        },
+    ])
+
+    st.markdown("#### Margin Evaluation Summary")
+    st.dataframe(summary_df, use_container_width=True, hide_index=True)
+
+    st.markdown("#### Margin Sweep Metrics")
+    st.dataframe(margin_sweep_df, use_container_width=True, hide_index=True)
+
+    st.markdown("#### Confusion Matrix")
+    if rf_summary["confusion_matrix"] is None:
+        st.warning("No samples were used at this margin threshold.")
+    else:
+        cm_df = pd.DataFrame(
+            rf_summary["confusion_matrix"],
+            index=["Actual DOWN", "Actual UP"],
+            columns=["Pred DOWN", "Pred UP"],
+        )
+        st.dataframe(cm_df, use_container_width=True)
+
+    st.markdown("#### Classification Report")
+    if rf_summary["classification_report_df"] is None:
+        st.warning("No classification report available for this margin threshold.")
+    else:
+        st.dataframe(
+            rf_summary["classification_report_df"],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    st.markdown("#### Sample Distribution")
+    actual_full, actual_used, pred_used_df = build_rf_distribution_tables(
+        y_true=y_true,
+        used_mask=rf_summary["used_mask"],
+        pred_used=rf_summary["pred_used"],
     )
 
     d1, d2, d3 = st.columns(3)
@@ -458,6 +693,12 @@ if "lstm_eval_results" not in st.session_state:
 if "xgb_eval_results" not in st.session_state:
     st.session_state.xgb_eval_results = None
 
+if "rf_eval_results" not in st.session_state:
+    st.session_state.rf_eval_results = None
+
+if "simple_rnn_eval_results" not in st.session_state:
+    st.session_state.simple_rnn_eval_results = None
+
 if "ensemble_eval_results" not in st.session_state:
     st.session_state.ensemble_eval_results = None
 
@@ -518,7 +759,9 @@ with st.expander("Global Evaluation Settings", expanded=True):
 
 st.divider()
 
-with st.expander("LSTM Evaluation", expanded=True):
+st.markdown("Main Framework")
+
+with st.expander("LSTM", expanded=False):
     st.subheader("LSTM Parameters")
 
     with st.form("lstm_eval_form"):
@@ -682,7 +925,7 @@ with st.expander("LSTM Evaluation", expanded=True):
         st.info("Use Retrain LSTM to train and save results, or Evaluate LSTM to load saved results.")
 
 
-with st.expander("XGBoost Evaluation", expanded=False):
+with st.expander("XGBoost", expanded=False):
     st.subheader("XGBoost Parameters")
 
     with st.form("xgb_eval_form"):
@@ -779,7 +1022,7 @@ with st.expander("XGBoost Evaluation", expanded=False):
     if retrain_xgb_clicked:
         try:
             with st.spinner("Retraining XGBoost..."):
-                output_df = train_xgb_model(
+                model, artifacts, output_df = train_xgb_model(
                     symbol=coin,
                     resolution=frequency,
                     start_date=start_date.isoformat(),
@@ -797,6 +1040,9 @@ with st.expander("XGBoost Evaluation", expanded=False):
                     use_sentiment_data=bool(use_sentiment_data),
                 )
 
+                output_df = output_df.copy()
+                output_df["y_true"] = (output_df["actual_trend"].astype(str).str.lower() == "up").astype(int)
+
                 xgb_summary = build_xgb_eval_summary(
                     y_true=output_df["y_true"].values.astype(int),
                     p_up=output_df["p_up"].values.astype(float),
@@ -808,6 +1054,7 @@ with st.expander("XGBoost Evaluation", expanded=False):
                     y_true=output_df["y_true"].values.astype(int),
                     p_up=output_df["p_up"].values.astype(float),
                     decision_boundary=float(decision_boundary),
+                    margins=[0.00, 0.02, 0.04, 0.06, 0.08, 0.10, 0.12, 0.15, 0.20],
                 )
 
                 st.session_state.xgb_eval_results = {
@@ -833,6 +1080,7 @@ with st.expander("XGBoost Evaluation", expanded=False):
                 st.error("Saved XGBoost evaluation files were not found. Retrain the model first.")
             else:
                 output_df = pd.read_csv(preds_path)
+                output_df["y_true"] = (output_df["actual_trend"].astype(str).str.lower() == "up").astype(int)
 
                 xgb_summary = build_xgb_eval_summary(
                     y_true=output_df["y_true"].values.astype(int),
@@ -845,6 +1093,7 @@ with st.expander("XGBoost Evaluation", expanded=False):
                     y_true=output_df["y_true"].values.astype(int),
                     p_up=output_df["p_up"].values.astype(float),
                     decision_boundary=float(decision_boundary),
+                    margins=[0.00, 0.02, 0.04, 0.06, 0.08, 0.10, 0.12, 0.15, 0.20],
                 )
 
                 st.session_state.xgb_eval_results = {
@@ -866,9 +1115,8 @@ with st.expander("XGBoost Evaluation", expanded=False):
     else:
         st.info("Use Retrain XGBoost to train and save results, or Evaluate XGBoost to load saved results.")
 
-st.divider()
 
-with st.expander("LSTM + XGBoost Ensemble Evaluation", expanded=False):
+with st.expander("LSTM + XGBoost Ensemble", expanded=False):
     st.subheader("Ensemble Parameters")
 
     lstm_paths_ensemble = build_lstm_save_paths(coin, frequency)
@@ -1028,6 +1276,7 @@ with st.expander("LSTM + XGBoost Ensemble Evaluation", expanded=False):
         st.info(
             "This evaluates already-saved LSTM and XGBoost artifacts for the current coin/frequency combination."
         )
+
 
 with st.expander("Ensemble + RL Filtering (Main Model)", expanded=False):
     st.subheader("Ensemble + RL Parameters")
@@ -1304,5 +1553,347 @@ with st.expander("Ensemble + RL Filtering (Main Model)", expanded=False):
 
 st.divider()
 
-with st.expander("LSTM (Alternative Target)"):
+st.markdown("Baseline and Alternate Models")
+
+with st.expander("Random Forest (Baseline)", expanded=False):
+    st.subheader("Random Forest Parameters")
+
+    with st.form("rf_eval_form"):
+        r1c1, r1c2, r1c3, r1c4 = st.columns(4)
+
+        with r1c1:
+            rf_n_estimators = st.number_input(
+                "rf_n_estimators",
+                min_value=10,
+                value=300,
+                step=10,
+            )
+
+        with r1c2:
+            rf_max_depth = st.number_input(
+                "rf_max_depth",
+                min_value=1,
+                value=8,
+                step=1,
+            )
+
+        with r1c3:
+            rf_min_samples_split = st.number_input(
+                "rf_min_samples_split",
+                min_value=2,
+                value=10,
+                step=1,
+            )
+
+        with r1c4:
+            rf_min_samples_leaf = st.number_input(
+                "rf_min_samples_leaf",
+                min_value=1,
+                value=3,
+                step=1,
+            )
+
+        r2c1, r2c2, r2c3, r2c4 = st.columns(4)
+
+        with r2c1:
+            rf_decision_boundary = st.number_input(
+                "rf_decision_boundary",
+                min_value=0.01,
+                max_value=0.99,
+                value=0.50,
+                step=0.01,
+                format="%.2f",
+            )
+
+        with r2c2:
+            rf_margin_threshold = st.number_input(
+                "rf_margin_threshold",
+                min_value=0.00,
+                max_value=0.49,
+                value=0.05,
+                step=0.01,
+                format="%.2f",
+            )
+
+        with r2c3:
+            rf_max_features = st.selectbox(
+                "rf_max_features",
+                options=["sqrt", "log2", None],
+                index=0,
+            )
+
+        st.caption(
+            "Random Forest baseline using the same engineered feature set as XGBoost, "
+            "without alternate data."
+        )
+
+        b1, b2 = st.columns(2)
+        with b1:
+            retrain_rf_clicked = st.form_submit_button("Retrain Random Forest", use_container_width=True)
+        with b2:
+            evaluate_rf_clicked = st.form_submit_button("Evaluate Random Forest", use_container_width=True)
+
+    rf_save_paths = build_rf_save_paths(coin, frequency)
+
+    if retrain_rf_clicked:
+        try:
+            with st.spinner("Retraining Random Forest..."):
+                model, artifacts, output_df = train_rf_model(
+                    symbol=coin,
+                    resolution=frequency,
+                    start_date=start_date.isoformat(),
+                    end_date=end_date.isoformat() if isinstance(end_date, date) else None,
+                    train_ratio=0.80,
+                    n_estimators=int(rf_n_estimators),
+                    max_depth=int(rf_max_depth),
+                    min_samples_split=int(rf_min_samples_split),
+                    min_samples_leaf=int(rf_min_samples_leaf),
+                    max_features=rf_max_features,
+                    decision_boundary=float(rf_decision_boundary),
+                    margin_threshold=float(rf_margin_threshold),
+                    artifacts_path=rf_save_paths["artifacts_path"],
+                    preds_csv_path=rf_save_paths["preds_csv_path"],
+                )
+
+                output_df = output_df.copy()
+                output_df["y_true"] = (output_df["actual_trend"].astype(str).str.lower() == "up").astype(int)
+
+                rf_summary = build_rf_eval_summary(
+                    y_true=output_df["y_true"].values.astype(int),
+                    p_up=output_df["p_up"].values.astype(float),
+                    decision_boundary=float(rf_decision_boundary),
+                    margin_threshold=float(rf_margin_threshold),
+                )
+
+                margin_sweep_df = build_rf_margin_sweep(
+                    y_true=output_df["y_true"].values.astype(int),
+                    p_up=output_df["p_up"].values.astype(float),
+                    decision_boundary=float(rf_decision_boundary),
+                    margins=[0.00, 0.02, 0.04, 0.06, 0.08, 0.10, 0.12, 0.15, 0.20],
+                )
+
+                st.session_state.rf_eval_results = {
+                    "output_df": output_df,
+                    "save_paths": rf_save_paths,
+                    "rf_summary": rf_summary,
+                    "margin_sweep_df": margin_sweep_df,
+                    "chosen_margin": float(rf_margin_threshold),
+                    "chosen_boundary": float(rf_decision_boundary),
+                }
+
+            st.success("Random Forest retraining and evaluation completed successfully.")
+
+        except Exception as e:
+            st.error(f"Random Forest retraining failed: {e}")
+
+    if evaluate_rf_clicked:
+        try:
+            preds_path = Path(rf_save_paths["preds_csv_path"])
+            artifacts_path = Path(rf_save_paths["artifacts_path"])
+
+            if not preds_path.exists() or not artifacts_path.exists():
+                st.error("Saved Random Forest evaluation files were not found. Retrain the model first.")
+            else:
+                output_df = pd.read_csv(preds_path)
+                output_df["y_true"] = (output_df["actual_trend"].astype(str).str.lower() == "up").astype(int)
+
+                rf_summary = build_rf_eval_summary(
+                    y_true=output_df["y_true"].values.astype(int),
+                    p_up=output_df["p_up"].values.astype(float),
+                    decision_boundary=float(rf_decision_boundary),
+                    margin_threshold=float(rf_margin_threshold),
+                )
+
+                margin_sweep_df = build_rf_margin_sweep(
+                    y_true=output_df["y_true"].values.astype(int),
+                    p_up=output_df["p_up"].values.astype(float),
+                    decision_boundary=float(rf_decision_boundary),
+                    margins=[0.00, 0.02, 0.04, 0.06, 0.08, 0.10, 0.12, 0.15, 0.20],
+                )
+
+                st.session_state.rf_eval_results = {
+                    "output_df": output_df,
+                    "save_paths": rf_save_paths,
+                    "rf_summary": rf_summary,
+                    "margin_sweep_df": margin_sweep_df,
+                    "chosen_margin": float(rf_margin_threshold),
+                    "chosen_boundary": float(rf_decision_boundary),
+                }
+
+                st.success("Loaded saved Random Forest evaluation results.")
+
+        except Exception as e:
+            st.error(f"Random Forest evaluation failed: {e}")
+
+    if st.session_state.rf_eval_results is not None:
+        render_rf_results(st.session_state.rf_eval_results)
+    else:
+        st.info("Use Retrain Random Forest to train and save results, or Evaluate Random Forest to load saved results.")
+
+
+with st.expander("Recurrent Neural Network (Baseline)", expanded=False):
+    st.subheader("Simple RNN Parameters")
+
+    with st.form("simple_rnn_eval_form"):
+        r1c1, r1c2, r1c3, r1c4 = st.columns(4)
+        with r1c1:
+            rnn_x_window_size = st.number_input("rnn_x_window_size", min_value=1, value=100, step=1)
+        with r1c2:
+            rnn_epochs = st.number_input("rnn_epochs", min_value=1, value=10, step=1)
+        with r1c3:
+            rnn_batch_size = st.number_input("rnn_batch_size", min_value=1, value=64, step=1)
+        with r1c4:
+            rnn_learning_rate = st.number_input(
+                "rnn_learning_rate",
+                min_value=0.0001,
+                value=0.0010,
+                step=0.0001,
+                format="%.4f",
+            )
+
+        r2c1, r2c2, r2c3, r2c4, r2c5 = st.columns(5)
+        with r2c1:
+            rnn_units = st.number_input("rnn_units", min_value=1, value=100, step=1)
+        with r2c2:
+            rnn_dropout = st.number_input(
+                "rnn_dropout",
+                min_value=0.0,
+                max_value=0.9,
+                value=0.20,
+                step=0.05,
+                format="%.2f",
+            )
+        with r2c3:
+            rnn_validation_split = st.number_input(
+                "rnn_validation_split",
+                min_value=0.01,
+                max_value=0.50,
+                value=0.05,
+                step=0.01,
+                format="%.2f",
+                disabled=True,
+            )
+        with r2c4:
+            rnn_early_stopping_patience = st.number_input(
+                "rnn_early_stopping_patience",
+                min_value=1,
+                value=3,
+                step=1,
+            )
+        with r2c5:
+            rnn_threshold = st.number_input(
+                "rnn_threshold",
+                min_value=0.01,
+                max_value=0.99,
+                value=0.53,
+                step=0.01,
+                format="%.2f",
+            )
+
+        st.caption(
+            "Vanilla Simple RNN baseline using the same sequence setup as LSTM. "
+            "Useful as a lower-complexity recurrent benchmark."
+        )
+
+        b1, b2 = st.columns(2)
+        with b1:
+            retrain_rnn_clicked = st.form_submit_button("Retrain Simple RNN", use_container_width=True)
+        with b2:
+            evaluate_rnn_clicked = st.form_submit_button("Evaluate Simple RNN", use_container_width=True)
+
+    simple_rnn_save_paths = build_simple_rnn_save_paths(coin, frequency)
+
+    if retrain_rnn_clicked:
+        try:
+            with st.spinner("Retraining Simple RNN..."):
+                thresholds = tuple(sorted(set([
+                    0.50, 0.51, 0.52, round(float(rnn_threshold), 2), 0.54, 0.55, 0.56, 0.57, 0.58
+                ])))
+
+                model, history, probs_df, metrics_df, scaler = train_simple_rnn_model(
+                    symbol=coin,
+                    resolution=frequency,
+                    start_date=start_date.isoformat(),
+                    end_date=end_date.isoformat() if isinstance(end_date, date) else None,
+                    x_window_size=int(rnn_x_window_size),
+                    epochs=int(rnn_epochs),
+                    batch_size=int(rnn_batch_size),
+                    train_ratio=0.80,
+                    validation_split=float(rnn_validation_split),
+                    learning_rate=float(rnn_learning_rate),
+                    rnn_units=int(rnn_units),
+                    dropout_rate=float(rnn_dropout),
+                    early_stopping_patience=int(rnn_early_stopping_patience),
+                    model_path=simple_rnn_save_paths["model_path"],
+                    scaler_path=simple_rnn_save_paths["scaler_path"],
+                    artifacts_path=simple_rnn_save_paths["artifacts_path"],
+                    test_probs_path=simple_rnn_save_paths["test_probs_path"],
+                    metrics_path=simple_rnn_save_paths["metrics_path"],
+                    thresholds=thresholds,
+                )
+
+                y_true = probs_df["y_true"].values.astype(int)
+                probs = probs_df["p"].values.astype(float)
+
+                threshold_summary = build_simple_rnn_threshold_summary(
+                    y_true=y_true,
+                    probs=probs,
+                    threshold=float(rnn_threshold),
+                )
+
+                st.session_state.simple_rnn_eval_results = {
+                    "history": history,
+                    "probs_df": probs_df,
+                    "metrics_df": metrics_df,
+                    "save_paths": simple_rnn_save_paths,
+                    "threshold_summary": threshold_summary,
+                    "chosen_threshold": float(rnn_threshold),
+                }
+
+            st.success("Simple RNN retraining and evaluation completed successfully.")
+
+        except Exception as e:
+            st.error(f"Simple RNN retraining failed: {e}")
+
+    if evaluate_rnn_clicked:
+        try:
+            probs_path = Path(simple_rnn_save_paths["test_probs_path"])
+            metrics_path = Path(simple_rnn_save_paths["metrics_path"])
+
+            if not probs_path.exists() or not metrics_path.exists():
+                st.error("Saved Simple RNN evaluation files were not found. Retrain the model first.")
+            else:
+                probs_df = pd.read_csv(probs_path)
+                metrics_df = pd.read_csv(metrics_path)
+
+                y_true = probs_df["y_true"].values.astype(int)
+                probs = probs_df["p"].values.astype(float)
+
+                threshold_summary = build_simple_rnn_threshold_summary(
+                    y_true=y_true,
+                    probs=probs,
+                    threshold=float(rnn_threshold),
+                )
+
+                st.session_state.simple_rnn_eval_results = {
+                    "history": None,
+                    "probs_df": probs_df,
+                    "metrics_df": metrics_df,
+                    "save_paths": simple_rnn_save_paths,
+                    "threshold_summary": threshold_summary,
+                    "chosen_threshold": float(rnn_threshold),
+                }
+
+                st.success("Loaded saved Simple RNN evaluation results.")
+
+        except Exception as e:
+            st.error(f"Simple RNN evaluation failed: {e}")
+
+    if st.session_state.simple_rnn_eval_results is not None:
+        render_simple_rnn_results(st.session_state.simple_rnn_eval_results)
+    else:
+        st.info("Use Retrain Simple RNN to train and save results, or Evaluate Simple RNN to load saved results.")
+
+
+with st.expander("LSTM (Alternative Target)", expanded=False):
     st.write("Alternative LSTM evaluation controls and outputs will go here.")
