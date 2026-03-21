@@ -1555,6 +1555,169 @@ st.divider()
 
 st.markdown("Baseline and Alternate Models")
 
+with st.expander("Recurrent Neural Network (Baseline)", expanded=False):
+    st.subheader("Simple RNN Parameters")
+
+    with st.form("simple_rnn_eval_form"):
+        r1c1, r1c2, r1c3, r1c4 = st.columns(4)
+        with r1c1:
+            rnn_x_window_size = st.number_input("rnn_x_window_size", min_value=1, value=100, step=1)
+        with r1c2:
+            rnn_epochs = st.number_input("rnn_epochs", min_value=1, value=10, step=1)
+        with r1c3:
+            rnn_batch_size = st.number_input("rnn_batch_size", min_value=1, value=64, step=1)
+        with r1c4:
+            rnn_learning_rate = st.number_input(
+                "rnn_learning_rate",
+                min_value=0.0001,
+                value=0.0010,
+                step=0.0001,
+                format="%.4f",
+            )
+
+        r2c1, r2c2, r2c3, r2c4, r2c5 = st.columns(5)
+        with r2c1:
+            rnn_units = st.number_input("rnn_units", min_value=1, value=100, step=1)
+        with r2c2:
+            rnn_dropout = st.number_input(
+                "rnn_dropout",
+                min_value=0.0,
+                max_value=0.9,
+                value=0.20,
+                step=0.05,
+                format="%.2f",
+            )
+        with r2c3:
+            rnn_validation_split = st.number_input(
+                "rnn_validation_split",
+                min_value=0.01,
+                max_value=0.50,
+                value=0.05,
+                step=0.01,
+                format="%.2f",
+                disabled=True,
+            )
+        with r2c4:
+            rnn_early_stopping_patience = st.number_input(
+                "rnn_early_stopping_patience",
+                min_value=1,
+                value=3,
+                step=1,
+            )
+        with r2c5:
+            rnn_threshold = st.number_input(
+                "rnn_threshold",
+                min_value=0.01,
+                max_value=0.99,
+                value=0.53,
+                step=0.01,
+                format="%.2f",
+            )
+
+        st.caption(
+            "Vanilla Simple RNN baseline using the same sequence setup as LSTM. "
+            "Useful as a lower-complexity recurrent benchmark."
+        )
+
+        b1, b2 = st.columns(2)
+        with b1:
+            retrain_rnn_clicked = st.form_submit_button("Retrain Simple RNN", use_container_width=True)
+        with b2:
+            evaluate_rnn_clicked = st.form_submit_button("Evaluate Simple RNN", use_container_width=True)
+
+    simple_rnn_save_paths = build_simple_rnn_save_paths(coin, frequency)
+
+    if retrain_rnn_clicked:
+        try:
+            with st.spinner("Retraining Simple RNN..."):
+                thresholds = tuple(sorted(set([
+                    0.50, 0.51, 0.52, round(float(rnn_threshold), 2), 0.54, 0.55, 0.56, 0.57, 0.58
+                ])))
+
+                model, history, probs_df, metrics_df, scaler = train_simple_rnn_model(
+                    symbol=coin,
+                    resolution=frequency,
+                    start_date=start_date.isoformat(),
+                    end_date=end_date.isoformat() if isinstance(end_date, date) else None,
+                    x_window_size=int(rnn_x_window_size),
+                    epochs=int(rnn_epochs),
+                    batch_size=int(rnn_batch_size),
+                    train_ratio=0.80,
+                    validation_split=float(rnn_validation_split),
+                    learning_rate=float(rnn_learning_rate),
+                    rnn_units=int(rnn_units),
+                    dropout_rate=float(rnn_dropout),
+                    early_stopping_patience=int(rnn_early_stopping_patience),
+                    model_path=simple_rnn_save_paths["model_path"],
+                    scaler_path=simple_rnn_save_paths["scaler_path"],
+                    artifacts_path=simple_rnn_save_paths["artifacts_path"],
+                    test_probs_path=simple_rnn_save_paths["test_probs_path"],
+                    metrics_path=simple_rnn_save_paths["metrics_path"],
+                    thresholds=thresholds,
+                )
+
+                y_true = probs_df["y_true"].values.astype(int)
+                probs = probs_df["p"].values.astype(float)
+
+                threshold_summary = build_simple_rnn_threshold_summary(
+                    y_true=y_true,
+                    probs=probs,
+                    threshold=float(rnn_threshold),
+                )
+
+                st.session_state.simple_rnn_eval_results = {
+                    "history": history,
+                    "probs_df": probs_df,
+                    "metrics_df": metrics_df,
+                    "save_paths": simple_rnn_save_paths,
+                    "threshold_summary": threshold_summary,
+                    "chosen_threshold": float(rnn_threshold),
+                }
+
+            st.success("Simple RNN retraining and evaluation completed successfully.")
+
+        except Exception as e:
+            st.error(f"Simple RNN retraining failed: {e}")
+
+    if evaluate_rnn_clicked:
+        try:
+            probs_path = Path(simple_rnn_save_paths["test_probs_path"])
+            metrics_path = Path(simple_rnn_save_paths["metrics_path"])
+
+            if not probs_path.exists() or not metrics_path.exists():
+                st.error("Saved Simple RNN evaluation files were not found. Retrain the model first.")
+            else:
+                probs_df = pd.read_csv(probs_path)
+                metrics_df = pd.read_csv(metrics_path)
+
+                y_true = probs_df["y_true"].values.astype(int)
+                probs = probs_df["p"].values.astype(float)
+
+                threshold_summary = build_simple_rnn_threshold_summary(
+                    y_true=y_true,
+                    probs=probs,
+                    threshold=float(rnn_threshold),
+                )
+
+                st.session_state.simple_rnn_eval_results = {
+                    "history": None,
+                    "probs_df": probs_df,
+                    "metrics_df": metrics_df,
+                    "save_paths": simple_rnn_save_paths,
+                    "threshold_summary": threshold_summary,
+                    "chosen_threshold": float(rnn_threshold),
+                }
+
+                st.success("Loaded saved Simple RNN evaluation results.")
+
+        except Exception as e:
+            st.error(f"Simple RNN evaluation failed: {e}")
+
+    if st.session_state.simple_rnn_eval_results is not None:
+        render_simple_rnn_results(st.session_state.simple_rnn_eval_results)
+    else:
+        st.info("Use Retrain Simple RNN to train and save results, or Evaluate Simple RNN to load saved results.")
+
 with st.expander("Random Forest (Baseline)", expanded=False):
     st.subheader("Random Forest Parameters")
 
@@ -1730,169 +1893,6 @@ with st.expander("Random Forest (Baseline)", expanded=False):
     else:
         st.info("Use Retrain Random Forest to train and save results, or Evaluate Random Forest to load saved results.")
 
-
-with st.expander("Recurrent Neural Network (Baseline)", expanded=False):
-    st.subheader("Simple RNN Parameters")
-
-    with st.form("simple_rnn_eval_form"):
-        r1c1, r1c2, r1c3, r1c4 = st.columns(4)
-        with r1c1:
-            rnn_x_window_size = st.number_input("rnn_x_window_size", min_value=1, value=100, step=1)
-        with r1c2:
-            rnn_epochs = st.number_input("rnn_epochs", min_value=1, value=10, step=1)
-        with r1c3:
-            rnn_batch_size = st.number_input("rnn_batch_size", min_value=1, value=64, step=1)
-        with r1c4:
-            rnn_learning_rate = st.number_input(
-                "rnn_learning_rate",
-                min_value=0.0001,
-                value=0.0010,
-                step=0.0001,
-                format="%.4f",
-            )
-
-        r2c1, r2c2, r2c3, r2c4, r2c5 = st.columns(5)
-        with r2c1:
-            rnn_units = st.number_input("rnn_units", min_value=1, value=100, step=1)
-        with r2c2:
-            rnn_dropout = st.number_input(
-                "rnn_dropout",
-                min_value=0.0,
-                max_value=0.9,
-                value=0.20,
-                step=0.05,
-                format="%.2f",
-            )
-        with r2c3:
-            rnn_validation_split = st.number_input(
-                "rnn_validation_split",
-                min_value=0.01,
-                max_value=0.50,
-                value=0.05,
-                step=0.01,
-                format="%.2f",
-                disabled=True,
-            )
-        with r2c4:
-            rnn_early_stopping_patience = st.number_input(
-                "rnn_early_stopping_patience",
-                min_value=1,
-                value=3,
-                step=1,
-            )
-        with r2c5:
-            rnn_threshold = st.number_input(
-                "rnn_threshold",
-                min_value=0.01,
-                max_value=0.99,
-                value=0.53,
-                step=0.01,
-                format="%.2f",
-            )
-
-        st.caption(
-            "Vanilla Simple RNN baseline using the same sequence setup as LSTM. "
-            "Useful as a lower-complexity recurrent benchmark."
-        )
-
-        b1, b2 = st.columns(2)
-        with b1:
-            retrain_rnn_clicked = st.form_submit_button("Retrain Simple RNN", use_container_width=True)
-        with b2:
-            evaluate_rnn_clicked = st.form_submit_button("Evaluate Simple RNN", use_container_width=True)
-
-    simple_rnn_save_paths = build_simple_rnn_save_paths(coin, frequency)
-
-    if retrain_rnn_clicked:
-        try:
-            with st.spinner("Retraining Simple RNN..."):
-                thresholds = tuple(sorted(set([
-                    0.50, 0.51, 0.52, round(float(rnn_threshold), 2), 0.54, 0.55, 0.56, 0.57, 0.58
-                ])))
-
-                model, history, probs_df, metrics_df, scaler = train_simple_rnn_model(
-                    symbol=coin,
-                    resolution=frequency,
-                    start_date=start_date.isoformat(),
-                    end_date=end_date.isoformat() if isinstance(end_date, date) else None,
-                    x_window_size=int(rnn_x_window_size),
-                    epochs=int(rnn_epochs),
-                    batch_size=int(rnn_batch_size),
-                    train_ratio=0.80,
-                    validation_split=float(rnn_validation_split),
-                    learning_rate=float(rnn_learning_rate),
-                    rnn_units=int(rnn_units),
-                    dropout_rate=float(rnn_dropout),
-                    early_stopping_patience=int(rnn_early_stopping_patience),
-                    model_path=simple_rnn_save_paths["model_path"],
-                    scaler_path=simple_rnn_save_paths["scaler_path"],
-                    artifacts_path=simple_rnn_save_paths["artifacts_path"],
-                    test_probs_path=simple_rnn_save_paths["test_probs_path"],
-                    metrics_path=simple_rnn_save_paths["metrics_path"],
-                    thresholds=thresholds,
-                )
-
-                y_true = probs_df["y_true"].values.astype(int)
-                probs = probs_df["p"].values.astype(float)
-
-                threshold_summary = build_simple_rnn_threshold_summary(
-                    y_true=y_true,
-                    probs=probs,
-                    threshold=float(rnn_threshold),
-                )
-
-                st.session_state.simple_rnn_eval_results = {
-                    "history": history,
-                    "probs_df": probs_df,
-                    "metrics_df": metrics_df,
-                    "save_paths": simple_rnn_save_paths,
-                    "threshold_summary": threshold_summary,
-                    "chosen_threshold": float(rnn_threshold),
-                }
-
-            st.success("Simple RNN retraining and evaluation completed successfully.")
-
-        except Exception as e:
-            st.error(f"Simple RNN retraining failed: {e}")
-
-    if evaluate_rnn_clicked:
-        try:
-            probs_path = Path(simple_rnn_save_paths["test_probs_path"])
-            metrics_path = Path(simple_rnn_save_paths["metrics_path"])
-
-            if not probs_path.exists() or not metrics_path.exists():
-                st.error("Saved Simple RNN evaluation files were not found. Retrain the model first.")
-            else:
-                probs_df = pd.read_csv(probs_path)
-                metrics_df = pd.read_csv(metrics_path)
-
-                y_true = probs_df["y_true"].values.astype(int)
-                probs = probs_df["p"].values.astype(float)
-
-                threshold_summary = build_simple_rnn_threshold_summary(
-                    y_true=y_true,
-                    probs=probs,
-                    threshold=float(rnn_threshold),
-                )
-
-                st.session_state.simple_rnn_eval_results = {
-                    "history": None,
-                    "probs_df": probs_df,
-                    "metrics_df": metrics_df,
-                    "save_paths": simple_rnn_save_paths,
-                    "threshold_summary": threshold_summary,
-                    "chosen_threshold": float(rnn_threshold),
-                }
-
-                st.success("Loaded saved Simple RNN evaluation results.")
-
-        except Exception as e:
-            st.error(f"Simple RNN evaluation failed: {e}")
-
-    if st.session_state.simple_rnn_eval_results is not None:
-        render_simple_rnn_results(st.session_state.simple_rnn_eval_results)
-    else:
-        st.info("Use Retrain Simple RNN to train and save results, or Evaluate Simple RNN to load saved results.")
 
 
 with st.expander("LSTM (Alternative Target)", expanded=False):
