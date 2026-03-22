@@ -1553,9 +1553,9 @@ with st.expander("Ensemble + RL Filtering (Main Model)", expanded=False):
 
 st.divider()
 
-st.markdown("Baseline and Alternate Models")
+st.markdown("Baseline Models")
 
-with st.expander("Recurrent Neural Network (Baseline)", expanded=False):
+with st.expander("Recurrent Neural Network", expanded=False):
     st.subheader("Simple RNN Parameters")
 
     with st.form("simple_rnn_eval_form"):
@@ -1718,7 +1718,7 @@ with st.expander("Recurrent Neural Network (Baseline)", expanded=False):
     else:
         st.info("Use Retrain Simple RNN to train and save results, or Evaluate Simple RNN to load saved results.")
 
-with st.expander("Random Forest (Baseline)", expanded=False):
+with st.expander("Random Forest", expanded=False):
     st.subheader("Random Forest Parameters")
 
     with st.form("rf_eval_form"):
@@ -1892,8 +1892,3 @@ with st.expander("Random Forest (Baseline)", expanded=False):
         render_rf_results(st.session_state.rf_eval_results)
     else:
         st.info("Use Retrain Random Forest to train and save results, or Evaluate Random Forest to load saved results.")
-
-
-
-with st.expander("LSTM (Alternative Target)", expanded=False):
-    st.write("Alternative LSTM evaluation controls and outputs will go here.")
