@@ -552,7 +552,7 @@ st.caption(f"Using sidebar selection: {coin} | {frequency}")
 
 st.divider()
 
-with st.expander("Global Evaluation Settings", expanded=True):
+with st.expander("Global Evaluation Settings", expanded=False):
     r1c1, r1c2, r1c3, r1c4, r1c5 = st.columns(5)
 
     with r1c1:
