@@ -1,4 +1,4 @@
-#sequence_builder.py
+#models/lstm/sequence_builder.py
 
 import pandas as pd
 import numpy as np
