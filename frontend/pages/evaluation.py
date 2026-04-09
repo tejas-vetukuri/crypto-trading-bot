@@ -50,23 +50,29 @@ def safe_auc(y_true: np.ndarray, probs: np.ndarray):
 
 def safe_binary_accuracy(y_true: np.ndarray, preds: np.ndarray):
     try:
-        if len(y_true) == 0:
-            return None
-        return float((y_true == preds).mean())
+        return float((y_true == preds).mean()) if len(y_true) else None
     except Exception:
         return None
 
 
+def margin_to_lstm_threshold(margin: float, center: float = 0.5) -> float:
+    return center + float(margin)
+
+
+def margin_to_symmetric_bounds(margin: float, center: float = 0.5):
+    margin = float(margin)
+    return center - margin, center + margin
+
+
 def load_simple_rnn_raw_accuracy(symbol: str, resolution: str):
     try:
-        save_paths = build_simple_rnn_save_paths(symbol, resolution)
-        probs_path = Path(save_paths["test_probs_path"])
+        probs_path = Path(build_simple_rnn_save_paths(symbol, resolution)["test_probs_path"])
         if not probs_path.exists():
             return None
 
         probs_df = pd.read_csv(probs_path)
-        y_true = probs_df["y_true"].values.astype(int)
-        probs = probs_df["p"].values.astype(float)
+        y_true = probs_df["y_true"].astype(int).values
+        probs = probs_df["p"].astype(float).values
         pred = (probs >= 0.5).astype(int)
         return safe_binary_accuracy(y_true, pred)
     except Exception:
@@ -75,16 +81,13 @@ def load_simple_rnn_raw_accuracy(symbol: str, resolution: str):
 
 def load_rf_raw_accuracy(symbol: str, resolution: str):
     try:
-        save_paths = build_rf_save_paths(symbol, resolution)
-        preds_path = Path(save_paths["preds_csv_path"])
+        preds_path = Path(build_rf_save_paths(symbol, resolution)["preds_csv_path"])
         if not preds_path.exists():
             return None
 
         output_df = pd.read_csv(preds_path)
-        y_true = (
-            output_df["actual_trend"].astype(str).str.lower() == "up"
-        ).astype(int).values
-        p_up = output_df["p_up"].values.astype(float)
+        y_true = (output_df["actual_trend"].astype(str).str.lower() == "up").astype(int).values
+        p_up = output_df["p_up"].astype(float).values
         pred = (p_up >= 0.5).astype(int)
         return safe_binary_accuracy(y_true, pred)
     except Exception:
@@ -99,23 +102,16 @@ def render_lstm_results(results: dict, coin: str, frequency: str):
     threshold_summary = results["threshold_summary"]
     chosen_threshold = results["chosen_threshold"]
 
-    y_true = probs_df["y_true"].values.astype(int)
-    probs = probs_df["p"].values.astype(float)
-    lstm_raw_pred = (probs >= 0.5).astype(int)
-    lstm_raw_accuracy = safe_binary_accuracy(y_true, lstm_raw_pred)
+    y_true = probs_df["y_true"].astype(int).values
+    probs = probs_df["p"].astype(float).values
+    lstm_raw_accuracy = safe_binary_accuracy(y_true, (probs >= 0.5).astype(int))
+    simple_rnn_raw_accuracy = load_simple_rnn_raw_accuracy(coin, frequency)
+    auc_val = safe_auc(y_true, probs)
 
-    train_acc = None
-    val_acc = None
+    train_acc = val_acc = None
     if history is not None:
         train_acc = history.history.get("accuracy", [None])[-1]
         val_acc = history.history.get("val_accuracy", [None])[-1]
-
-    auc_val = safe_auc(y_true, probs)
-
-    simple_rnn_raw_accuracy = load_simple_rnn_raw_accuracy(
-        symbol=coin,
-        resolution=frequency,
-    )
 
     st.markdown("### Results")
 
@@ -219,17 +215,11 @@ def render_xgb_results(results: dict, coin: str, frequency: str):
     chosen_margin = results["chosen_margin"]
     chosen_boundary = results["chosen_boundary"]
 
-    y_true = output_df["y_true"].values.astype(int)
-    p_up = output_df["p_up"].values.astype(float)
-    xgb_raw_pred = (p_up >= 0.5).astype(int)
-    xgb_raw_accuracy = safe_binary_accuracy(y_true, xgb_raw_pred)
-
+    y_true = output_df["y_true"].astype(int).values
+    p_up = output_df["p_up"].astype(float).values
+    xgb_raw_accuracy = safe_binary_accuracy(y_true, (p_up >= 0.5).astype(int))
+    rf_raw_accuracy = load_rf_raw_accuracy(coin, frequency)
     auc_val = safe_auc(y_true, p_up)
-
-    rf_raw_accuracy = load_rf_raw_accuracy(
-        symbol=coin,
-        resolution=frequency,
-    )
 
     st.markdown("### Results")
 
@@ -524,23 +514,18 @@ def render_rl_results(results: dict):
     st.dataframe(paths_df, use_container_width=True, hide_index=True)
 
 
-if "coin" not in st.session_state:
-    st.session_state.coin = "BTCUSDT"
+for key, value in {
+    "coin": "BTCUSDT",
+    "interval": "1h",
+    "lstm_eval_results": None,
+    "xgb_eval_results": None,
+    "ensemble_eval_results": None,
+    "rl_eval_results": None,
+    "use_latest_data": True,
+}.items():
+    if key not in st.session_state:
+        st.session_state[key] = value
 
-if "interval" not in st.session_state:
-    st.session_state.interval = "1h"
-
-if "lstm_eval_results" not in st.session_state:
-    st.session_state.lstm_eval_results = None
-
-if "xgb_eval_results" not in st.session_state:
-    st.session_state.xgb_eval_results = None
-
-if "ensemble_eval_results" not in st.session_state:
-    st.session_state.ensemble_eval_results = None
-
-if "rl_eval_results" not in st.session_state:
-    st.session_state.rl_eval_results = None
 
 st.title("Model Evaluation Lab")
 
@@ -549,7 +534,6 @@ frequency = st.session_state.interval
 default_start = get_default_start_date(frequency)
 
 st.caption(f"Using sidebar selection: {coin} | {frequency}")
-
 st.divider()
 
 with st.expander("Global Evaluation Settings", expanded=False):
@@ -563,9 +547,6 @@ with st.expander("Global Evaluation Settings", expanded=False):
         )
 
     with r1c2:
-        if "use_latest_data" not in st.session_state:
-            st.session_state.use_latest_data = True
-
         if st.session_state.use_latest_data:
             end_date = None
             st.text_input("End Date", value="Latest", disabled=True)
@@ -577,31 +558,13 @@ with st.expander("Global Evaluation Settings", expanded=False):
             )
 
     with r1c3:
-        capital = st.number_input(
-            "capital",
-            min_value=1.0,
-            value=5000.0,
-            step=100.0,
-            format="%.1f",
-        )
+        capital = st.number_input("capital", min_value=1.0, value=5000.0, step=100.0, format="%.1f")
 
     with r1c4:
-        rr = st.number_input(
-            "rr",
-            min_value=0.10,
-            value=1.25,
-            step=0.05,
-            format="%.2f",
-        )
+        rr = st.number_input("rr", min_value=0.10, value=1.25, step=0.05, format="%.2f")
 
     with r1c5:
-        leverage = st.number_input(
-            "leverage",
-            min_value=1.0,
-            value=25.0,
-            step=1.0,
-            format="%.1f",
-        )
+        leverage = st.number_input("leverage", min_value=1.0, value=25.0, step=1.0, format="%.1f")
 
     r2c1, r2c2, r2c3, r2c4, r2c5 = st.columns(5)
 
@@ -615,33 +578,15 @@ with st.expander("Global Evaluation Settings", expanded=False):
         )
 
     with r2c3:
-        max_horizon = st.number_input(
-            "max_horizon",
-            min_value=1,
-            value=3,
-            step=1,
-        )
+        max_horizon = st.number_input("max_horizon", min_value=1, value=3, step=1)
 
     with r2c4:
-        fee_bps = st.number_input(
-            "fee_bps",
-            min_value=0.0,
-            value=2.0,
-            step=0.5,
-            format="%.1f",
-        )
+        fee_bps = st.number_input("fee_bps", min_value=0.0, value=2.0, step=0.5, format="%.1f")
 
     with r2c5:
-        trade_penalty_bps = st.number_input(
-            "trade_penalty_bps",
-            min_value=0.0,
-            value=2.0,
-            step=0.5,
-            format="%.1f",
-        )
+        trade_penalty_bps = st.number_input("trade_penalty_bps", min_value=0.0, value=2.0, step=0.5, format="%.1f")
 
 st.divider()
-
 st.markdown("Main Framework")
 
 with st.expander("LSTM", expanded=False):
@@ -694,18 +639,25 @@ with st.expander("LSTM", expanded=False):
                 step=1,
             )
         with r2c5:
-            threshold = st.number_input(
-                "threshold",
-                min_value=0.01,
-                max_value=0.99,
-                value=0.53,
+            lstm_margin = st.number_input(
+                "margin_threshold",
+                min_value=0.00,
+                max_value=0.49,
+                value=0.03,
                 step=0.01,
                 format="%.2f",
+                help="Symmetric margin around 0.50. Example: 0.03 corresponds to an upper threshold of 0.53.",
             )
+
+        lstm_threshold = margin_to_lstm_threshold(float(lstm_margin))
 
         st.caption(
             "Note: Default parameters are set to the best-performing configuration identified "
             "through prior grid search tuning on BTCUSDT 1h data."
+        )
+        st.caption(
+            f"LSTM uses margin format. Current margin={float(lstm_margin):.2f}, "
+            f"corresponding to threshold={float(lstm_threshold):.2f}."
         )
 
         b1, b2 = st.columns(2)
@@ -720,10 +672,10 @@ with st.expander("LSTM", expanded=False):
         try:
             with st.spinner("Retraining LSTM..."):
                 thresholds = tuple(sorted(set([
-                    0.50, 0.51, 0.52, round(float(threshold), 2), 0.54, 0.55, 0.56, 0.57, 0.58
+                    0.50, 0.51, 0.52, round(float(lstm_threshold), 2), 0.54, 0.55, 0.56, 0.57, 0.58
                 ])))
 
-                model, history, probs_df, metrics_df, scaler = train_lstm_model(
+                _, history, probs_df, metrics_df, _ = train_lstm_model(
                     symbol=coin,
                     resolution=frequency,
                     start_date=start_date.isoformat(),
@@ -745,13 +697,13 @@ with st.expander("LSTM", expanded=False):
                     thresholds=thresholds,
                 )
 
-                y_true = probs_df["y_true"].values.astype(int)
-                probs = probs_df["p"].values.astype(float)
+                y_true = probs_df["y_true"].astype(int).values
+                probs = probs_df["p"].astype(float).values
 
                 threshold_summary = build_threshold_summary(
                     y_true=y_true,
                     probs=probs,
-                    threshold=float(threshold),
+                    threshold=float(lstm_threshold),
                 )
 
                 st.session_state.lstm_eval_results = {
@@ -760,7 +712,7 @@ with st.expander("LSTM", expanded=False):
                     "metrics_df": metrics_df,
                     "save_paths": save_paths,
                     "threshold_summary": threshold_summary,
-                    "chosen_threshold": float(threshold),
+                    "chosen_threshold": float(lstm_threshold),
                 }
 
             st.success("LSTM retraining and evaluation completed successfully.")
@@ -779,13 +731,13 @@ with st.expander("LSTM", expanded=False):
                 probs_df = pd.read_csv(probs_path)
                 metrics_df = pd.read_csv(metrics_path)
 
-                y_true = probs_df["y_true"].values.astype(int)
-                probs = probs_df["p"].values.astype(float)
+                y_true = probs_df["y_true"].astype(int).values
+                probs = probs_df["p"].astype(float).values
 
                 threshold_summary = build_threshold_summary(
                     y_true=y_true,
                     probs=probs,
-                    threshold=float(threshold),
+                    threshold=float(lstm_threshold),
                 )
 
                 st.session_state.lstm_eval_results = {
@@ -794,7 +746,7 @@ with st.expander("LSTM", expanded=False):
                     "metrics_df": metrics_df,
                     "save_paths": save_paths,
                     "threshold_summary": threshold_summary,
-                    "chosen_threshold": float(threshold),
+                    "chosen_threshold": float(lstm_threshold),
                 }
 
                 st.success("Loaded saved LSTM evaluation results.")
@@ -814,12 +766,7 @@ with st.expander("XGBoost", expanded=False):
     with st.form("xgb_eval_form"):
         r1c1, r1c2, r1c3, r1c4 = st.columns(4)
         with r1c1:
-            n_estimators = st.number_input(
-                "n_estimators",
-                min_value=10,
-                value=300,
-                step=10,
-            )
+            n_estimators = st.number_input("n_estimators", min_value=10, value=300, step=10)
         with r1c2:
             learning_rate_xgb = st.number_input(
                 "learning_rate",
@@ -829,12 +776,7 @@ with st.expander("XGBoost", expanded=False):
                 format="%.3f",
             )
         with r1c3:
-            max_depth = st.number_input(
-                "max_depth",
-                min_value=1,
-                value=6,
-                step=1,
-            )
+            max_depth = st.number_input("max_depth", min_value=1, value=6, step=1)
         with r1c4:
             subsample = st.number_input(
                 "subsample",
@@ -874,18 +816,16 @@ with st.expander("XGBoost", expanded=False):
                 format="%.2f",
             )
 
-        is_sentiment_available = (coin.upper() == "BTCUSDT" and frequency == "1h")
+        is_sentiment_available = coin.upper() == "BTCUSDT" and frequency == "1h"
 
         with r2c4:
             st.markdown("<div style='height: 8px'></div>", unsafe_allow_html=True)
-
             use_sentiment_data = st.checkbox(
                 "use sentiment data",
                 value=False,
                 disabled=not is_sentiment_available,
                 help="Available only for BTC 1h. Adds Bybit derivatives features (OI + LSR).",
             )
-
             if not is_sentiment_available:
                 st.caption("Sentiment features currently supported only for BTC 1h experiments.")
 
@@ -905,7 +845,7 @@ with st.expander("XGBoost", expanded=False):
     if retrain_xgb_clicked:
         try:
             with st.spinner("Retraining XGBoost..."):
-                model, artifacts, output_df = train_xgb_model(
+                _, _, output_df = train_xgb_model(
                     symbol=coin,
                     resolution=frequency,
                     start_date=start_date.isoformat(),
@@ -927,15 +867,15 @@ with st.expander("XGBoost", expanded=False):
                 output_df["y_true"] = (output_df["actual_trend"].astype(str).str.lower() == "up").astype(int)
 
                 xgb_summary = build_xgb_eval_summary(
-                    y_true=output_df["y_true"].values.astype(int),
-                    p_up=output_df["p_up"].values.astype(float),
+                    y_true=output_df["y_true"].astype(int).values,
+                    p_up=output_df["p_up"].astype(float).values,
                     decision_boundary=float(decision_boundary),
                     margin_threshold=float(margin_threshold),
                 )
 
                 margin_sweep_df = build_xgb_margin_sweep(
-                    y_true=output_df["y_true"].values.astype(int),
-                    p_up=output_df["p_up"].values.astype(float),
+                    y_true=output_df["y_true"].astype(int).values,
+                    p_up=output_df["p_up"].astype(float).values,
                     decision_boundary=float(decision_boundary),
                     margins=[0.00, 0.02, 0.04, 0.06, 0.08, 0.10, 0.12, 0.15, 0.20],
                 )
@@ -966,15 +906,15 @@ with st.expander("XGBoost", expanded=False):
                 output_df["y_true"] = (output_df["actual_trend"].astype(str).str.lower() == "up").astype(int)
 
                 xgb_summary = build_xgb_eval_summary(
-                    y_true=output_df["y_true"].values.astype(int),
-                    p_up=output_df["p_up"].values.astype(float),
+                    y_true=output_df["y_true"].astype(int).values,
+                    p_up=output_df["p_up"].astype(float).values,
                     decision_boundary=float(decision_boundary),
                     margin_threshold=float(margin_threshold),
                 )
 
                 margin_sweep_df = build_xgb_margin_sweep(
-                    y_true=output_df["y_true"].values.astype(int),
-                    p_up=output_df["p_up"].values.astype(float),
+                    y_true=output_df["y_true"].astype(int).values,
+                    p_up=output_df["p_up"].astype(float).values,
                     decision_boundary=float(decision_boundary),
                     margins=[0.00, 0.02, 0.04, 0.06, 0.08, 0.10, 0.12, 0.15, 0.20],
                 )
@@ -1029,64 +969,60 @@ with st.expander("LSTM + XGBoost Ensemble", expanded=False):
             )
 
         with r1c3:
-            ensemble_upper = st.number_input(
-                "ensemble_upper",
-                min_value=0.50,
-                max_value=0.99,
-                value=0.60,
+            ensemble_margin = st.number_input(
+                "ensemble_margin_threshold",
+                min_value=0.00,
+                max_value=0.49,
+                value=0.10,
                 step=0.01,
                 format="%.2f",
+                help="Symmetric margin around 0.50. Example: 0.10 gives lower=0.40 and upper=0.60.",
             )
 
         with r1c4:
-            ensemble_lower = st.number_input(
-                "ensemble_lower",
-                min_value=0.01,
-                max_value=0.50,
-                value=0.40,
-                step=0.01,
-                format="%.2f",
-            )
+            st.text_input("ensemble_bounds", value="auto from margin", disabled=True)
+
+        ensemble_lower, ensemble_upper = margin_to_symmetric_bounds(float(ensemble_margin))
 
         r2c1 = st.columns(1)[0]
-
         with r2c1:
-            lstm_threshold_ensemble = st.number_input(
-                "lstm_threshold",
-                min_value=0.01,
-                max_value=0.99,
-                value=0.53,
+            lstm_margin_ensemble = st.number_input(
+                "lstm_margin_threshold",
+                min_value=0.00,
+                max_value=0.49,
+                value=0.03,
                 step=0.01,
                 format="%.2f",
+                help="LSTM symmetric margin around 0.50.",
             )
+
+        lstm_threshold_ensemble = margin_to_lstm_threshold(float(lstm_margin_ensemble))
 
         st.caption(
             "This section does not retrain models. It evaluates the saved LSTM and XGBoost artifacts "
             "for the currently selected coin/frequency combination."
         )
-
         st.caption(
             "Shared global trading settings applied here: "
             f"capital={float(capital):.1f}, rr={float(rr):.2f}, leverage={float(leverage):.1f}, "
             f"max_horizon={int(max_horizon)}, fee_bps={float(fee_bps):.1f}, "
             f"trade_penalty_bps={float(trade_penalty_bps):.1f}."
         )
-
+        st.caption(
+            f"Ensemble margin={float(ensemble_margin):.2f} -> lower={float(ensemble_lower):.2f}, "
+            f"upper={float(ensemble_upper):.2f}. "
+            f"LSTM margin={float(lstm_margin_ensemble):.2f} -> threshold={float(lstm_threshold_ensemble):.2f}."
+        )
         st.caption(
             f"LSTM artifacts: {lstm_paths_ensemble['artifacts_path']}  |  "
             f"XGBoost artifacts: {xgb_paths_ensemble['artifacts_path']}"
         )
 
-        evaluate_ensemble_clicked = st.form_submit_button(
-            "Evaluate Ensemble",
-            use_container_width=True,
-        )
+        evaluate_ensemble_clicked = st.form_submit_button("Evaluate Ensemble", use_container_width=True)
 
     if evaluate_ensemble_clicked:
         try:
-            if ensemble_lower >= ensemble_upper:
-                st.error("ensemble_lower must be smaller than ensemble_upper.")
-            elif (ensemble_weight_xgb + ensemble_weight_lstm) <= 0:
+            if (ensemble_weight_xgb + ensemble_weight_lstm) <= 0:
                 st.error("At least one ensemble weight must be greater than zero.")
             elif not Path(lstm_paths_ensemble["artifacts_path"]).exists():
                 st.error(
@@ -1100,7 +1036,7 @@ with st.expander("LSTM + XGBoost Ensemble", expanded=False):
                 )
             else:
                 with st.spinner("Evaluating ensemble..."):
-                    result = evaluate_ensemble_only(
+                    st.session_state.ensemble_eval_results = evaluate_ensemble_only(
                         symbol=coin,
                         resolution=frequency,
                         start_date=start_date.isoformat(),
@@ -1127,8 +1063,6 @@ with st.expander("LSTM + XGBoost Ensemble", expanded=False):
                         verbose=False,
                     )
 
-                    st.session_state.ensemble_eval_results = result
-
                 st.success("Ensemble evaluation completed successfully.")
 
         except Exception as e:
@@ -1137,9 +1071,7 @@ with st.expander("LSTM + XGBoost Ensemble", expanded=False):
     if st.session_state.ensemble_eval_results is not None:
         render_ensemble_results(st.session_state.ensemble_eval_results)
     else:
-        st.info(
-            "This evaluates already-saved LSTM and XGBoost artifacts for the current coin/frequency combination."
-        )
+        st.info("This evaluates already-saved LSTM and XGBoost artifacts for the current coin/frequency combination.")
 
 
 with st.expander("Ensemble + RL Filtering (Main Model)", expanded=False):
@@ -1171,36 +1103,35 @@ with st.expander("Ensemble + RL Filtering (Main Model)", expanded=False):
             )
 
         with r1c3:
-            rl_ensemble_upper = st.number_input(
-                "rl_ensemble_upper",
-                min_value=0.50,
-                max_value=0.99,
-                value=0.60,
+            rl_ensemble_margin = st.number_input(
+                "rl_ensemble_margin_threshold",
+                min_value=0.00,
+                max_value=0.49,
+                value=0.10,
                 step=0.01,
                 format="%.2f",
+                help="Symmetric margin around 0.50. Example: 0.10 gives lower=0.40 and upper=0.60.",
             )
 
         with r1c4:
-            rl_ensemble_lower = st.number_input(
-                "rl_ensemble_lower",
-                min_value=0.01,
-                max_value=0.50,
-                value=0.40,
-                step=0.01,
-                format="%.2f",
-            )
+            st.text_input("rl_ensemble_bounds", value="auto from margin", disabled=True)
+
+        rl_ensemble_lower, rl_ensemble_upper = margin_to_symmetric_bounds(float(rl_ensemble_margin))
 
         r2c1, r2c2, r2c3 = st.columns(3)
 
         with r2c1:
-            rl_lstm_threshold = st.number_input(
-                "rl_lstm_threshold",
-                min_value=0.01,
-                max_value=0.99,
-                value=0.53,
+            rl_lstm_margin = st.number_input(
+                "rl_lstm_margin_threshold",
+                min_value=0.00,
+                max_value=0.49,
+                value=0.03,
                 step=0.01,
                 format="%.2f",
+                help="LSTM symmetric margin around 0.50.",
             )
+
+        rl_lstm_threshold = margin_to_lstm_threshold(float(rl_lstm_margin))
 
         with r2c2:
             rl_alpha = st.number_input(
@@ -1235,20 +1166,10 @@ with st.expander("Ensemble + RL Filtering (Main Model)", expanded=False):
             )
 
         with r3c2:
-            rl_episodes = st.number_input(
-                "episodes",
-                min_value=1,
-                value=60,
-                step=1,
-            )
+            rl_episodes = st.number_input("episodes", min_value=1, value=60, step=1)
 
         with r3c3:
-            rl_min_take_visits = st.number_input(
-                "min_take_visits",
-                min_value=0,
-                value=20,
-                step=1,
-            )
+            rl_min_take_visits = st.number_input("min_take_visits", min_value=0, value=20, step=1)
 
         with r3c4:
             rl_q_take_margin = st.number_input(
@@ -1259,9 +1180,7 @@ with st.expander("Ensemble + RL Filtering (Main Model)", expanded=False):
                 format="%.2f",
             )
 
-        r4c1 = st.columns(1)[0]
-
-        with r4c1:
+        with st.columns(1)[0]:
             rl_skip_reward_scale = st.number_input(
                 "skip_reward_scale",
                 min_value=0.00,
@@ -1274,13 +1193,16 @@ with st.expander("Ensemble + RL Filtering (Main Model)", expanded=False):
             "This section uses the saved LSTM and XGBoost artifacts for the selected coin/frequency, "
             "then trains or evaluates the RL trade filter on top of the ensemble."
         )
-
         st.caption(
             "Risk settings use the shared global configuration for capital, rr, leverage, "
             "max_horizon, fee_bps, and trade_penalty_bps. "
             "Fixed values remain: risk_per_trade=0.02, sl_atr_mult=1.0, min_atr_pct=0.001."
         )
-
+        st.caption(
+            f"RL ensemble margin={float(rl_ensemble_margin):.2f} -> lower={float(rl_ensemble_lower):.2f}, "
+            f"upper={float(rl_ensemble_upper):.2f}. "
+            f"LSTM margin={float(rl_lstm_margin):.2f} -> threshold={float(rl_lstm_threshold):.2f}."
+        )
         st.caption(
             f"LSTM artifacts: {rl_combo_paths['lstm_artifacts_path']}  |  "
             f"XGBoost artifacts: {rl_combo_paths['xgb_artifacts_path']}  |  "
@@ -1306,9 +1228,7 @@ with st.expander("Ensemble + RL Filtering (Main Model)", expanded=False):
 
     if train_rl_clicked:
         try:
-            if rl_ensemble_lower >= rl_ensemble_upper:
-                st.error("rl_ensemble_lower must be smaller than rl_ensemble_upper.")
-            elif (rl_ensemble_weight_xgb + rl_ensemble_weight_lstm) <= 0:
+            if (rl_ensemble_weight_xgb + rl_ensemble_weight_lstm) <= 0:
                 st.error("At least one RL ensemble weight must be greater than zero.")
             elif not Path(rl_combo_paths["lstm_artifacts_path"]).exists():
                 st.error(
@@ -1352,9 +1272,7 @@ with st.expander("Ensemble + RL Filtering (Main Model)", expanded=False):
 
     if eval_rl_clicked:
         try:
-            if rl_ensemble_lower >= rl_ensemble_upper:
-                st.error("rl_ensemble_lower must be smaller than rl_ensemble_upper.")
-            elif (rl_ensemble_weight_xgb + rl_ensemble_weight_lstm) <= 0:
+            if (rl_ensemble_weight_xgb + rl_ensemble_weight_lstm) <= 0:
                 st.error("At least one RL ensemble weight must be greater than zero.")
             elif not Path(rl_combo_paths["lstm_artifacts_path"]).exists():
                 st.error(
@@ -1373,7 +1291,7 @@ with st.expander("Ensemble + RL Filtering (Main Model)", expanded=False):
                 )
             else:
                 with st.spinner("Evaluating RL filter..."):
-                    result = evaluate_rl_agent(
+                    st.session_state.rl_eval_results = evaluate_rl_agent(
                         symbol=coin,
                         resolution=frequency,
                         start_date=start_date.isoformat(),
@@ -1393,8 +1311,6 @@ with st.expander("Ensemble + RL Filtering (Main Model)", expanded=False):
                         q_take_margin=float(rl_q_take_margin),
                     )
 
-                    st.session_state.rl_eval_results = result
-
                 st.success("RL filter evaluation completed successfully.")
 
         except Exception as e:
@@ -1403,6 +1319,4 @@ with st.expander("Ensemble + RL Filtering (Main Model)", expanded=False):
     if st.session_state.rl_eval_results is not None:
         render_rl_results(st.session_state.rl_eval_results)
     else:
-        st.info(
-            "Use Train RL Filter to train and save the RL agent, or Evaluate RL Filter to evaluate a saved RL agent."
-        )
+        st.info("Use Train RL Filter to train and save the RL agent, or Evaluate RL Filter to evaluate a saved RL agent.")
