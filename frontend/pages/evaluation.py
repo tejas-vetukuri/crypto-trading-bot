@@ -25,6 +25,51 @@ from models.rl.rl_ensemble import build_combo_artifact_paths
 from models.xgboost.xgb import build_xgb_save_paths, train_xgb_model
 
 
+def fmt_float(value: float) -> str:
+    return f"{float(value):.2f}"
+
+
+def caption_fixed_defaults(**kwargs) -> str:
+    parts = [f"{key}={value}" for key, value in kwargs.items()]
+    return f"Only selected controls are exposed. Fixed defaults: {', '.join(parts)}."
+
+
+def caption_decision_logic(
+    decision_boundary: float,
+    margin: float,
+    lstm_margin: float | None = None,
+    lstm_threshold: float | None = None,
+) -> str:
+    lower = float(decision_boundary) - float(margin)
+    upper = float(decision_boundary) + float(margin)
+
+    text = (
+        f"Decision boundary={fmt_float(decision_boundary)}, "
+        f"margin={fmt_float(margin)} \u2192 "
+        f"lower={fmt_float(lower)}, upper={fmt_float(upper)}."
+    )
+
+    if lstm_margin is not None and lstm_threshold is not None:
+        text += (
+            f" LSTM margin={fmt_float(lstm_margin)} \u2192 "
+            f"threshold={fmt_float(lstm_threshold)}."
+        )
+
+    return text
+
+
+def caption_lstm_logic(lstm_margin: float, lstm_threshold: float) -> str:
+    return (
+        f"LSTM margin={fmt_float(lstm_margin)} \u2192 "
+        f"threshold={fmt_float(lstm_threshold)}."
+    )
+
+
+def caption_artifacts(**kwargs) -> str:
+    parts = [f"{key}={value}" for key, value in kwargs.items()]
+    return f"Artifacts: {' | '.join(parts)}"
+
+
 st.set_page_config(page_title="Model Evaluation Lab", layout="wide")
 init_session_state()
 
@@ -95,6 +140,8 @@ st.markdown("Main Framework")
 with st.expander("LSTM", expanded=False):
     st.subheader("LSTM Parameters")
 
+    lstm_paths = build_lstm_save_paths(coin, frequency)
+
     with st.form("lstm_eval_form"):
         r1c1, r1c2, r1c3 = st.columns(3)
         with r1c1:
@@ -131,15 +178,24 @@ with st.expander("LSTM", expanded=False):
             )
 
         lstm_threshold = margin_to_lstm_threshold(float(lstm_margin_threshold))
+
         st.caption(
-            f"Only the selected controls are exposed. Fixed defaults: "
-            f"batch_size={DEFAULTS['lstm_batch_size']}, "
-            f"dropout={DEFAULTS['lstm_dropout_rate']:.2f}, "
-            f"validation_split={DEFAULTS['validation_split']:.2f}."
+            caption_fixed_defaults(
+                batch_size=DEFAULTS["lstm_batch_size"],
+                dropout=f"{DEFAULTS['lstm_dropout_rate']:.2f}",
+                validation_split=f"{DEFAULTS['validation_split']:.2f}",
+            )
         )
         st.caption(
-            f"Current LSTM margin={float(lstm_margin_threshold):.2f}, "
-            f"corresponding threshold={float(lstm_threshold):.2f}."
+            caption_lstm_logic(
+                lstm_margin=float(lstm_margin_threshold),
+                lstm_threshold=float(lstm_threshold),
+            )
+        )
+        st.caption(
+            caption_artifacts(
+                LSTM=lstm_paths["artifacts_path"],
+            )
         )
 
         b1, b2 = st.columns(2)
@@ -188,6 +244,8 @@ with st.expander("LSTM", expanded=False):
 with st.expander("XGBoost", expanded=False):
     st.subheader("XGBoost Parameters")
 
+    xgb_paths = build_xgb_save_paths(coin, frequency)
+
     with st.form("xgb_eval_form"):
         r1c1, r1c2, r1c3 = st.columns(3)
         with r1c1:
@@ -233,12 +291,25 @@ with st.expander("XGBoost", expanded=False):
             )
 
         st.caption(
-            f"Only the selected controls are exposed. Fixed defaults: "
-            f"subsample={DEFAULTS['xgb_subsample']:.2f}, "
-            f"colsample_bytree={DEFAULTS['xgb_colsample_bytree']:.2f}."
+            caption_fixed_defaults(
+                subsample=f"{DEFAULTS['xgb_subsample']:.2f}",
+                colsample_bytree=f"{DEFAULTS['xgb_colsample_bytree']:.2f}",
+            )
         )
+        st.caption(
+            caption_decision_logic(
+                decision_boundary=float(decision_boundary),
+                margin=float(margin_threshold),
+            )
+        )
+        st.caption(
+            caption_artifacts(
+                XGBoost=xgb_paths["artifacts_path"],
+            )
+        )
+
         if not is_sentiment_available:
-            st.caption("use_sentiment_data is currently available only for BTCUSDT 1h.")
+            st.caption("Sentiment features are available only for BTCUSDT 1h.")
 
         b1, b2 = st.columns(2)
         with b1:
@@ -338,20 +409,21 @@ with st.expander("LSTM + XGBoost Ensemble", expanded=False):
                 format="%.2f",
             )
 
-        ensemble_lower = float(ensemble_decision_boundary) - float(ensemble_margin_threshold)
-        ensemble_upper = float(ensemble_decision_boundary) + float(ensemble_margin_threshold)
         lstm_threshold_ensemble = margin_to_lstm_threshold(float(lstm_margin_threshold_ensemble))
 
         st.caption(
-            f"Ensemble decision boundary={float(ensemble_decision_boundary):.2f}, "
-            f"margin={float(ensemble_margin_threshold):.2f} -> "
-            f"lower={float(ensemble_lower):.2f}, upper={float(ensemble_upper):.2f}. "
-            f"LSTM margin={float(lstm_margin_threshold_ensemble):.2f} "
-            f"-> threshold={float(lstm_threshold_ensemble):.2f}."
+            caption_decision_logic(
+                decision_boundary=float(ensemble_decision_boundary),
+                margin=float(ensemble_margin_threshold),
+                lstm_margin=float(lstm_margin_threshold_ensemble),
+                lstm_threshold=float(lstm_threshold_ensemble),
+            )
         )
         st.caption(
-            f"LSTM artifacts: {lstm_paths_ensemble['artifacts_path']} | "
-            f"XGBoost artifacts: {xgb_paths_ensemble['artifacts_path']}"
+            caption_artifacts(
+                LSTM=lstm_paths_ensemble["artifacts_path"],
+                XGBoost=xgb_paths_ensemble["artifacts_path"],
+            )
         )
 
         evaluate_ensemble_clicked = st.form_submit_button("Evaluate Ensemble", use_container_width=True)
@@ -456,30 +528,34 @@ with st.expander("Ensemble + RL Filtering (Main Model)", expanded=False):
             q_take_margin = st.number_input(
                 "q_take_margin",
                 min_value=0.00,
-                value=0.35,
+                value=0.27,
                 step=0.01,
                 format="%.2f",
             )
 
-        rl_ensemble_lower = float(rl_ensemble_decision_boundary) - float(rl_ensemble_margin_threshold)
-        rl_ensemble_upper = float(rl_ensemble_decision_boundary) + float(rl_ensemble_margin_threshold)
         rl_lstm_threshold = margin_to_lstm_threshold(float(rl_lstm_margin_threshold))
 
         st.caption(
-            f"Only the selected controls are exposed. Fixed RL defaults: "
-            f"alpha={DEFAULTS['rl_alpha']:.2f}, gamma={DEFAULTS['rl_gamma']:.2f}, eps={DEFAULTS['rl_eps']:.2f}."
+            caption_fixed_defaults(
+                alpha=f"{DEFAULTS['rl_alpha']:.2f}",
+                gamma=f"{DEFAULTS['rl_gamma']:.2f}",
+                eps=f"{DEFAULTS['rl_eps']:.2f}",
+            )
         )
         st.caption(
-            f"RL ensemble decision boundary={float(rl_ensemble_decision_boundary):.2f}, "
-            f"margin={float(rl_ensemble_margin_threshold):.2f} -> "
-            f"lower={float(rl_ensemble_lower):.2f}, upper={float(rl_ensemble_upper):.2f}. "
-            f"LSTM margin={float(rl_lstm_margin_threshold):.2f} -> "
-            f"threshold={float(rl_lstm_threshold):.2f}."
+            caption_decision_logic(
+                decision_boundary=float(rl_ensemble_decision_boundary),
+                margin=float(rl_ensemble_margin_threshold),
+                lstm_margin=float(rl_lstm_margin_threshold),
+                lstm_threshold=float(rl_lstm_threshold),
+            )
         )
         st.caption(
-            f"LSTM artifacts: {rl_combo_paths['lstm_artifacts_path']} | "
-            f"XGBoost artifacts: {rl_combo_paths['xgb_artifacts_path']} | "
-            f"RL agent: {rl_combo_paths['rl_agent_path']}"
+            caption_artifacts(
+                LSTM=rl_combo_paths["lstm_artifacts_path"],
+                XGBoost=rl_combo_paths["xgb_artifacts_path"],
+                RL=rl_combo_paths["rl_agent_path"],
+            )
         )
 
         b1, b2 = st.columns(2)
