@@ -1,0 +1,6 @@
+numpy>=1.26,<2.1
+pandas>=2.1
+scikit-learn>=1.4
+tensorflow==2.18.1
+requests>=2.32
+joblib>=1.3

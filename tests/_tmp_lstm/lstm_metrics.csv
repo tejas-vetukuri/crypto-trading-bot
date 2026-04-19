@@ -1,0 +1,3 @@
+symbol,resolution,threshold,used_count,accuracy,coverage
+BTCUSDT,1h,0.5,26,0.5,1.0
+BTCUSDT,1h,0.55,26,0.5,1.0
