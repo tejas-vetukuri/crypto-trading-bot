@@ -147,6 +147,11 @@ def build_threshold_summary(y_true: np.ndarray, probs: np.ndarray, threshold: fl
     used_samples = int(used_mask.sum())
     total_samples = int(len(y_true))
 
+    try:
+        auc_roc = float(roc_auc_score(y_true, probs))
+    except Exception:
+        auc_roc = None
+
     result = {
         "threshold": float(threshold),
         "coverage": coverage,
@@ -154,6 +159,7 @@ def build_threshold_summary(y_true: np.ndarray, probs: np.ndarray, threshold: fl
         "used_samples": used_samples,
         "total_samples": total_samples,
         "used_accuracy": None,
+        "auc_roc": auc_roc,
         "random_baseline_accuracy": None,
         "majority_baseline_accuracy": None,
         "confusion_matrix": None,
@@ -238,14 +244,14 @@ def main():
     tag = combo_tag(symbol, resolution)
     save_paths = build_simple_rnn_save_paths(symbol, resolution)
 
-    thresholds = (0.50, 0.51, 0.52, 0.53, 0.54, 0.55, 0.56, 0.57, 0.58)
-
     print("🚀 Starting Simple RNN Baseline Evaluation...\n")
     print(f"Symbol:      {symbol}")
     print(f"Resolution:  {resolution}")
     print(f"Start date:  {start_date}")
     print(f"Combo tag:   {tag}")
     print(f"Model path:  {save_paths['model_path']}")
+    print(f"Artifacts:   {save_paths['artifacts_path']}")
+    print(f"Test probs:  {save_paths['test_probs_path']}")
     print()
 
     model, history, probs_df, metrics_df, scaler = train_simple_rnn_model(
@@ -267,38 +273,45 @@ def main():
         artifacts_path=save_paths["artifacts_path"],
         test_probs_path=save_paths["test_probs_path"],
         metrics_path=save_paths["metrics_path"],
-        thresholds=thresholds,
+        thresholds=(0.50,),
     )
-
-    print("\n================ TRAINING SUMMARY ================")
-    if "accuracy" in history.history:
-        print(f"Final Training Accuracy:   {history.history['accuracy'][-1]:.4f}")
-    if "val_accuracy" in history.history:
-        print(f"Final Validation Accuracy: {history.history['val_accuracy'][-1]:.4f}")
 
     y_true = probs_df["y_true"].values.astype(int)
     probs = probs_df["p"].values.astype(float)
+    y_pred = (probs >= 0.5).astype(int)
 
-    evaluate_auc(y_true, probs)
+    acc = accuracy_score(y_true, y_pred)
+    try:
+        auc = roc_auc_score(y_true, probs)
+    except Exception:
+        auc = None
 
-    print("\n📊 ================= THRESHOLDS + BASELINES =================")
-    for t in thresholds:
-        print("\n" + "=" * 55)
+    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
 
-        coverage = evaluate_threshold(y_true, probs, threshold=t)
+    print("\n📈 ================= RAW RESULTS =================")
+    print(f"✅ Accuracy: {acc:.4f}")
+    if auc is None:
+        print("📈 ROC-AUC: could not be computed")
+    else:
+        print(f"📈 ROC-AUC: {auc:.4f}")
 
-        rand_acc = random_baseline_with_coverage(y_true, coverage=coverage, seed=42)
-        maj_acc = majority_baseline_with_coverage(y_true, coverage=coverage)
+    print("\n🔢 Confusion Matrix:")
+    print(cm)
 
-        print("\n📌 Baselines (matched coverage):")
-        print("Random Baseline Accuracy:  ", "nan" if np.isnan(rand_acc) else f"{rand_acc:.4f}")
-        print("Majority Baseline Accuracy:", "nan" if np.isnan(maj_acc) else f"{maj_acc:.4f}")
+    print("\n📄 Classification Report:")
+    print(classification_report(
+        y_true,
+        y_pred,
+        labels=[0, 1],
+        target_names=["DOWN", "UP"],
+        zero_division=0,
+    ))
 
     print("\n📊 Test probs preview:")
     print(probs_df.head())
     print(f"\nTotal test samples: {len(probs_df)}")
 
-    print("\n✅ Full evaluation completed successfully")
+    print("\n✅ Simple RNN raw evaluation completed successfully")
     print(f"✅ Saved combination files for: {tag}")
 
 

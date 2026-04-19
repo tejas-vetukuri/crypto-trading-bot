@@ -8,7 +8,6 @@ from frontend.services.evaluation_helpers import (
     DEFAULTS,
     init_session_state,
     margin_to_lstm_threshold,
-    margin_to_symmetric_bounds,
     render_ensemble_results,
     render_lstm_results,
     render_rl_results,
@@ -21,10 +20,9 @@ from frontend.services.evaluation_helpers import (
     run_xgb_retrain,
     train_rl_filter,
 )
-from models.lstm.lstm import get_default_start_date, train_lstm_model
-from models.xgboost.xgb import build_xgb_save_paths, train_xgb_model
-from models.lstm.lstm import build_lstm_save_paths
+from models.lstm.lstm import build_lstm_save_paths, get_default_start_date, train_lstm_model
 from models.rl.rl_ensemble import build_combo_artifact_paths
+from models.xgboost.xgb import build_xgb_save_paths, train_xgb_model
 
 
 st.set_page_config(page_title="Model Evaluation Lab", layout="wide")
@@ -43,7 +41,11 @@ with st.expander("Global Evaluation Settings", expanded=False):
     r1c1, r1c2, r1c3, r1c4, r1c5 = st.columns(5)
 
     with r1c1:
-        start_date = st.date_input("Start Date", value=date.fromisoformat(default_start), key="global_start_date")
+        start_date = st.date_input(
+            "Start Date",
+            value=date.fromisoformat(default_start),
+            key="global_start_date",
+        )
 
     with r1c2:
         if st.session_state.use_latest_data:
@@ -123,7 +125,7 @@ with st.expander("LSTM", expanded=False):
                 "margin_threshold",
                 min_value=0.00,
                 max_value=0.49,
-                value=0.03,
+                value=0.08,
                 step=0.01,
                 format="%.2f",
             )
@@ -289,7 +291,7 @@ with st.expander("LSTM + XGBoost Ensemble", expanded=False):
     xgb_paths_ensemble = build_xgb_save_paths(coin, frequency)
 
     with st.form("ensemble_eval_form"):
-        r1c1, r1c2, r1c3, r1c4 = st.columns(4)
+        r1c1, r1c2, r1c3, r1c4, r1c5 = st.columns(5)
         with r1c1:
             ensemble_weight_xgb = st.number_input(
                 "ensemble_weight_xgb",
@@ -309,6 +311,15 @@ with st.expander("LSTM + XGBoost Ensemble", expanded=False):
                 format="%.2f",
             )
         with r1c3:
+            ensemble_decision_boundary = st.number_input(
+                "ensemble_decision_boundary",
+                min_value=0.01,
+                max_value=0.99,
+                value=0.48,
+                step=0.01,
+                format="%.2f",
+            )
+        with r1c4:
             ensemble_margin_threshold = st.number_input(
                 "ensemble_margin_threshold",
                 min_value=0.00,
@@ -317,22 +328,25 @@ with st.expander("LSTM + XGBoost Ensemble", expanded=False):
                 step=0.01,
                 format="%.2f",
             )
-        with r1c4:
+        with r1c5:
             lstm_margin_threshold_ensemble = st.number_input(
                 "lstm_margin_threshold",
                 min_value=0.00,
                 max_value=0.49,
-                value=0.03,
+                value=0.08,
                 step=0.01,
                 format="%.2f",
             )
 
-        ensemble_lower, ensemble_upper = margin_to_symmetric_bounds(float(ensemble_margin_threshold))
+        ensemble_lower = float(ensemble_decision_boundary) - float(ensemble_margin_threshold)
+        ensemble_upper = float(ensemble_decision_boundary) + float(ensemble_margin_threshold)
         lstm_threshold_ensemble = margin_to_lstm_threshold(float(lstm_margin_threshold_ensemble))
 
         st.caption(
-            f"Ensemble margin={float(ensemble_margin_threshold):.2f} -> lower={float(ensemble_lower):.2f}, "
-            f"upper={float(ensemble_upper):.2f}. LSTM margin={float(lstm_margin_threshold_ensemble):.2f} "
+            f"Ensemble decision boundary={float(ensemble_decision_boundary):.2f}, "
+            f"margin={float(ensemble_margin_threshold):.2f} -> "
+            f"lower={float(ensemble_lower):.2f}, upper={float(ensemble_upper):.2f}. "
+            f"LSTM margin={float(lstm_margin_threshold_ensemble):.2f} "
             f"-> threshold={float(lstm_threshold_ensemble):.2f}."
         )
         st.caption(
@@ -358,6 +372,7 @@ with st.expander("LSTM + XGBoost Ensemble", expanded=False):
                     max_horizon=int(max_horizon),
                     ensemble_weight_xgb=float(ensemble_weight_xgb),
                     ensemble_weight_lstm=float(ensemble_weight_lstm),
+                    ensemble_decision_boundary=float(ensemble_decision_boundary),
                     ensemble_margin_threshold=float(ensemble_margin_threshold),
                     lstm_margin_threshold=float(lstm_margin_threshold_ensemble),
                 )
@@ -377,7 +392,7 @@ with st.expander("Ensemble + RL Filtering (Main Model)", expanded=False):
     rl_combo_paths = build_combo_artifact_paths(coin, frequency)
 
     with st.form("rl_eval_form"):
-        r1c1, r1c2, r1c3, r1c4 = st.columns(4)
+        r1c1, r1c2, r1c3, r1c4, r1c5 = st.columns(5)
         with r1c1:
             rl_ensemble_weight_xgb = st.number_input(
                 "rl_ensemble_weight_xgb",
@@ -397,6 +412,15 @@ with st.expander("Ensemble + RL Filtering (Main Model)", expanded=False):
                 format="%.2f",
             )
         with r1c3:
+            rl_ensemble_decision_boundary = st.number_input(
+                "rl_ensemble_decision_boundary",
+                min_value=0.01,
+                max_value=0.99,
+                value=0.48,
+                step=0.01,
+                format="%.2f",
+            )
+        with r1c4:
             rl_ensemble_margin_threshold = st.number_input(
                 "rl_ensemble_margin_threshold",
                 min_value=0.00,
@@ -405,19 +429,19 @@ with st.expander("Ensemble + RL Filtering (Main Model)", expanded=False):
                 step=0.01,
                 format="%.2f",
             )
-        with r1c4:
+        with r1c5:
             rl_lstm_margin_threshold = st.number_input(
                 "rl_lstm_margin_threshold",
                 min_value=0.00,
                 max_value=0.49,
-                value=0.03,
+                value=0.08,
                 step=0.01,
                 format="%.2f",
             )
 
         r2c1, r2c2, r2c3, r2c4 = st.columns(4)
         with r2c1:
-            episodes = st.number_input("episodes", min_value=1, value=60, step=1)
+            episodes = st.number_input("episodes", min_value=1, value=30, step=1)
         with r2c2:
             skip_reward_scale = st.number_input(
                 "skip_reward_scale",
@@ -432,12 +456,13 @@ with st.expander("Ensemble + RL Filtering (Main Model)", expanded=False):
             q_take_margin = st.number_input(
                 "q_take_margin",
                 min_value=0.00,
-                value=0.20,
+                value=0.35,
                 step=0.01,
                 format="%.2f",
             )
 
-        rl_ensemble_lower, rl_ensemble_upper = margin_to_symmetric_bounds(float(rl_ensemble_margin_threshold))
+        rl_ensemble_lower = float(rl_ensemble_decision_boundary) - float(rl_ensemble_margin_threshold)
+        rl_ensemble_upper = float(rl_ensemble_decision_boundary) + float(rl_ensemble_margin_threshold)
         rl_lstm_threshold = margin_to_lstm_threshold(float(rl_lstm_margin_threshold))
 
         st.caption(
@@ -445,9 +470,11 @@ with st.expander("Ensemble + RL Filtering (Main Model)", expanded=False):
             f"alpha={DEFAULTS['rl_alpha']:.2f}, gamma={DEFAULTS['rl_gamma']:.2f}, eps={DEFAULTS['rl_eps']:.2f}."
         )
         st.caption(
-            f"RL ensemble margin={float(rl_ensemble_margin_threshold):.2f} -> lower={float(rl_ensemble_lower):.2f}, "
-            f"upper={float(rl_ensemble_upper):.2f}. LSTM margin={float(rl_lstm_margin_threshold):.2f} "
-            f"-> threshold={float(rl_lstm_threshold):.2f}."
+            f"RL ensemble decision boundary={float(rl_ensemble_decision_boundary):.2f}, "
+            f"margin={float(rl_ensemble_margin_threshold):.2f} -> "
+            f"lower={float(rl_ensemble_lower):.2f}, upper={float(rl_ensemble_upper):.2f}. "
+            f"LSTM margin={float(rl_lstm_margin_threshold):.2f} -> "
+            f"threshold={float(rl_lstm_threshold):.2f}."
         )
         st.caption(
             f"LSTM artifacts: {rl_combo_paths['lstm_artifacts_path']} | "
@@ -477,6 +504,7 @@ with st.expander("Ensemble + RL Filtering (Main Model)", expanded=False):
                     max_horizon=int(max_horizon),
                     rl_ensemble_weight_xgb=float(rl_ensemble_weight_xgb),
                     rl_ensemble_weight_lstm=float(rl_ensemble_weight_lstm),
+                    rl_ensemble_decision_boundary=float(rl_ensemble_decision_boundary),
                     rl_ensemble_margin_threshold=float(rl_ensemble_margin_threshold),
                     rl_lstm_margin_threshold=float(rl_lstm_margin_threshold),
                     episodes=int(episodes),
@@ -502,6 +530,7 @@ with st.expander("Ensemble + RL Filtering (Main Model)", expanded=False):
                     max_horizon=int(max_horizon),
                     rl_ensemble_weight_xgb=float(rl_ensemble_weight_xgb),
                     rl_ensemble_weight_lstm=float(rl_ensemble_weight_lstm),
+                    rl_ensemble_decision_boundary=float(rl_ensemble_decision_boundary),
                     rl_ensemble_margin_threshold=float(rl_ensemble_margin_threshold),
                     rl_lstm_margin_threshold=float(rl_lstm_margin_threshold),
                     min_take_visits=int(min_take_visits),

@@ -338,6 +338,7 @@ def run_ensemble_evaluate(
     max_horizon: int,
     ensemble_weight_xgb: float,
     ensemble_weight_lstm: float,
+    ensemble_decision_boundary: float,
     ensemble_margin_threshold: float,
     lstm_margin_threshold: float,
 ) -> dict[str, Any]:
@@ -354,7 +355,6 @@ def run_ensemble_evaluate(
     if (ensemble_weight_xgb + ensemble_weight_lstm) <= 0:
         raise ValueError("At least one ensemble weight must be greater than zero.")
 
-    ensemble_lower, ensemble_upper = margin_to_symmetric_bounds(ensemble_margin_threshold)
     lstm_threshold = margin_to_lstm_threshold(lstm_margin_threshold)
     risk = build_risk_config(capital, rr, leverage, fee_bps, trade_penalty_bps)
 
@@ -370,8 +370,8 @@ def run_ensemble_evaluate(
         risk=risk,
         ensemble_weight_xgb=float(ensemble_weight_xgb),
         ensemble_weight_lstm=float(ensemble_weight_lstm),
-        ensemble_upper=float(ensemble_upper),
-        ensemble_lower=float(ensemble_lower),
+        ensemble_decision_boundary=float(ensemble_decision_boundary),
+        ensemble_margin=float(ensemble_margin_threshold),
         max_horizon=int(max_horizon),
         verbose=False,
     )
@@ -391,6 +391,7 @@ def train_rl_filter(
     max_horizon: int,
     rl_ensemble_weight_xgb: float,
     rl_ensemble_weight_lstm: float,
+    rl_ensemble_decision_boundary: float,
     rl_ensemble_margin_threshold: float,
     rl_lstm_margin_threshold: float,
     episodes: int,
@@ -407,7 +408,8 @@ def train_rl_filter(
     if (rl_ensemble_weight_xgb + rl_ensemble_weight_lstm) <= 0:
         raise ValueError("At least one RL ensemble weight must be greater than zero.")
 
-    rl_ensemble_lower, rl_ensemble_upper = margin_to_symmetric_bounds(rl_ensemble_margin_threshold)
+    rl_ensemble_lower = float(rl_ensemble_decision_boundary) - float(rl_ensemble_margin_threshold)
+    rl_ensemble_upper = float(rl_ensemble_decision_boundary) + float(rl_ensemble_margin_threshold)
     rl_lstm_threshold = margin_to_lstm_threshold(rl_lstm_margin_threshold)
     rl_risk = build_risk_config(capital, rr, leverage, fee_bps, trade_penalty_bps)
 
@@ -451,6 +453,7 @@ def run_rl_evaluate(
     max_horizon: int,
     rl_ensemble_weight_xgb: float,
     rl_ensemble_weight_lstm: float,
+    rl_ensemble_decision_boundary: float,
     rl_ensemble_margin_threshold: float,
     rl_lstm_margin_threshold: float,
     min_take_visits: int,
@@ -468,7 +471,8 @@ def run_rl_evaluate(
     if (rl_ensemble_weight_xgb + rl_ensemble_weight_lstm) <= 0:
         raise ValueError("At least one RL ensemble weight must be greater than zero.")
 
-    rl_ensemble_lower, rl_ensemble_upper = margin_to_symmetric_bounds(rl_ensemble_margin_threshold)
+    rl_ensemble_lower = float(rl_ensemble_decision_boundary) - float(rl_ensemble_margin_threshold)
+    rl_ensemble_upper = float(rl_ensemble_decision_boundary) + float(rl_ensemble_margin_threshold)
     rl_lstm_threshold = margin_to_lstm_threshold(rl_lstm_margin_threshold)
     rl_risk = build_risk_config(capital, rr, leverage, fee_bps, trade_penalty_bps)
 
@@ -709,12 +713,21 @@ def render_ensemble_results(results: dict[str, Any]) -> None:
     trade_no_fees = results["trade_metrics_no_fees"]
     merged_preview = results["merged_preview"]
 
+    rows_evaluated = int(results.get("rows_evaluated", 0))
+    used_n = int(ensemble_metrics.get("ensemble_3way_n_non_hold", 0))
+    coverage = (used_n / rows_evaluated) if rows_evaluated > 0 else 0.0
+
     st.markdown("### Results")
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("XGB Acc (non-hold)", f"{base_metrics['xgb_accuracy_non_hold']:.4f}")
-    c2.metric("LSTM Acc (non-hold)", f"{base_metrics['lstm_accuracy_non_hold']:.4f}")
-    c3.metric("Ensemble 2-way Acc", f"{ensemble_metrics['ensemble_2way_accuracy']:.4f}")
-    c4.metric("Ensemble 3-way Acc", f"{ensemble_metrics['ensemble_3way_accuracy_non_hold']:.4f}")
+    c1.metric(
+        "ROC-AUC (raw)",
+        f"{float(ensemble_metrics['ensemble_raw_roc_auc']):.4f}"
+        if ensemble_metrics.get("ensemble_raw_roc_auc") is not None
+        else "—",
+    )
+    c2.metric("Raw Accuracy", f"{ensemble_metrics['ensemble_2way_accuracy']:.4f}")
+    c3.metric("Used Accuracy", f"{ensemble_metrics['ensemble_3way_accuracy_non_hold']:.4f}")
+    c4.metric("Coverage", f"{coverage:.4f}")
 
     summary_df = pd.DataFrame([
         {"Metric": "Rows Evaluated", "Value": results["rows_evaluated"]},
@@ -723,39 +736,67 @@ def render_ensemble_results(results: dict[str, Any]) -> None:
         {"Metric": "XGB Non-hold Sample Count", "Value": base_metrics["xgb_n"]},
         {"Metric": "LSTM Non-hold Accuracy", "Value": f"{base_metrics['lstm_accuracy_non_hold']:.4f}"},
         {"Metric": "LSTM Non-hold Sample Count", "Value": base_metrics["lstm_n"]},
-        {"Metric": "Ensemble 2-way Accuracy", "Value": f"{ensemble_metrics['ensemble_2way_accuracy']:.4f}"},
-        {"Metric": "Ensemble 2-way Sample Count", "Value": ensemble_metrics["ensemble_2way_n"]},
         {
-            "Metric": "Ensemble 3-way Accuracy (non-hold)",
+            "Metric": "Ensemble Raw ROC-AUC",
+            "Value": "—" if ensemble_metrics.get("ensemble_raw_roc_auc") is None else f"{ensemble_metrics['ensemble_raw_roc_auc']:.4f}",
+        },
+        {"Metric": "Ensemble Raw Accuracy", "Value": f"{ensemble_metrics['ensemble_2way_accuracy']:.4f}"},
+        {"Metric": "Ensemble Raw Sample Count", "Value": ensemble_metrics["ensemble_2way_n"]},
+        {
+            "Metric": "Ensemble Used Accuracy",
             "Value": f"{ensemble_metrics['ensemble_3way_accuracy_non_hold']:.4f}",
         },
-        {"Metric": "Ensemble 3-way Non-hold Sample Count", "Value": ensemble_metrics["ensemble_3way_n_non_hold"]},
+        {"Metric": "Ensemble Used Sample Count", "Value": ensemble_metrics["ensemble_3way_n_non_hold"]},
+        {"Metric": "Coverage", "Value": f"{coverage:.4f}"},
         {"Metric": "Agreement-only Accuracy", "Value": f"{ensemble_metrics['agreement_only_accuracy']:.4f}"},
         {"Metric": "Agreement-only Sample Count", "Value": ensemble_metrics["agreement_only_n"]},
         {"Metric": "XGB Weight", "Value": f"{ensemble_metrics['ensemble_weight_xgb']:.2f}"},
         {"Metric": "LSTM Weight", "Value": f"{ensemble_metrics['ensemble_weight_lstm']:.2f}"},
+        {"Metric": "Decision Boundary", "Value": f"{ensemble_metrics['ensemble_decision_boundary']:.2f}"},
+        {"Metric": "Margin", "Value": f"{ensemble_metrics['ensemble_margin']:.2f}"},
         {"Metric": "Ensemble Lower", "Value": f"{ensemble_metrics['ensemble_lower']:.2f}"},
         {"Metric": "Ensemble Upper", "Value": f"{ensemble_metrics['ensemble_upper']:.2f}"},
     ])
     st.markdown("#### Ensemble Summary")
     st.dataframe(summary_df, use_container_width=True, hide_index=True)
 
+    st.markdown("#### Classification Metrics")
+    cm = ensemble_metrics.get("ensemble_used_confusion_matrix")
+    if cm is None:
+        st.warning("No non-hold ensemble predictions were available.")
+    else:
+        cm_df = pd.DataFrame(
+            cm,
+            index=["Actual DOWN", "Actual UP"],
+            columns=["Pred DOWN", "Pred UP"],
+        )
+        st.markdown("**Confusion Matrix (used only)**")
+        st.dataframe(cm_df, use_container_width=True)
+
+    report_df = ensemble_metrics.get("ensemble_used_classification_report_df")
+    if report_df is None:
+        st.warning("No classification report was available for used predictions.")
+    else:
+        st.markdown("**Classification Report (used only)**")
+        st.dataframe(report_df, use_container_width=True, hide_index=True)
+
     t1, t2, t3, t4 = st.columns(4)
     t1.metric("Setups", trade_with_fees["setups"])
     t2.metric("Win Rate", f"{trade_with_fees['win_rate']:.4f}")
     t3.metric("Avg Net R / Trade", f"{trade_with_fees['avg_net_r_per_trade']:.4f}")
-    t4.metric("Total Return", f"{trade_with_fees['total_return']:.4f}")
+    t4.metric("Total Return (net)", f"{trade_with_fees['total_return']:.4f}")
 
     trade_df = pd.DataFrame([
-        {"Metric": "Setups", "With Fees": trade_with_fees["setups"], "No Fees": trade_no_fees["setups"]},
-        {"Metric": "Taken", "With Fees": trade_with_fees["taken"], "No Fees": trade_no_fees["taken"]},
+        {"Metric": "Candidate Setups", "With Fees": trade_with_fees["setups"], "No Fees": trade_no_fees["setups"]},
+        {"Metric": "Taken Trades", "With Fees": trade_with_fees["taken"], "No Fees": trade_no_fees["taken"]},
+        {"Metric": "Skipped Trades", "With Fees": trade_with_fees["skipped"], "No Fees": trade_no_fees["skipped"]},
         {"Metric": "Take Rate", "With Fees": f"{trade_with_fees['take_rate']:.4f}", "No Fees": f"{trade_no_fees['take_rate']:.4f}"},
         {"Metric": "Directional Accuracy", "With Fees": f"{trade_with_fees['directional_accuracy']:.4f}", "No Fees": f"{trade_no_fees['directional_accuracy']:.4f}"},
         {"Metric": "Win Rate", "With Fees": f"{trade_with_fees['win_rate']:.4f}", "No Fees": f"{trade_no_fees['win_rate']:.4f}"},
         {"Metric": "Avg Gross R / Trade", "With Fees": f"{trade_with_fees['avg_gross_r_per_trade']:.4f}", "No Fees": f"{trade_no_fees['avg_gross_r_per_trade']:.4f}"},
         {"Metric": "Avg Net R / Trade", "With Fees": f"{trade_with_fees['avg_net_r_per_trade']:.4f}", "No Fees": f"{trade_no_fees['avg_net_r_per_trade']:.4f}"},
-        {"Metric": "Total Return", "With Fees": f"{trade_with_fees['total_return']:.4f}", "No Fees": f"{trade_no_fees['total_return']:.4f}"},
-        {"Metric": "Max Drawdown", "With Fees": f"{trade_with_fees['max_drawdown']:.4f}", "No Fees": f"{trade_no_fees['max_drawdown']:.4f}"},
+        {"Metric": "Total Return (net)", "With Fees": f"{trade_with_fees['total_return']:.4f}", "No Fees": f"{trade_no_fees['total_return']:.4f}"},
+        {"Metric": "Max Drawdown (net)", "With Fees": f"{trade_with_fees['max_drawdown']:.4f}", "No Fees": f"{trade_no_fees['max_drawdown']:.4f}"},
         {"Metric": "TP Exits", "With Fees": trade_with_fees["tp_exits"], "No Fees": trade_no_fees["tp_exits"]},
         {"Metric": "SL Exits", "With Fees": trade_with_fees["sl_exits"], "No Fees": trade_no_fees["sl_exits"]},
         {"Metric": "Horizon Exits", "With Fees": trade_with_fees["horizon_exits"], "No Fees": trade_no_fees["horizon_exits"]},

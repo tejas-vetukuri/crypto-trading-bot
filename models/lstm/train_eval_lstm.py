@@ -34,6 +34,17 @@ def apply_ignore_zone(probs: np.ndarray, threshold: float):
     return pred, used_mask
 
 
+def _safe_roc_auc(y_true: np.ndarray, probs: np.ndarray):
+    try:
+        y_true = np.asarray(y_true).astype(int)
+        probs = np.asarray(probs).astype(float)
+        if len(np.unique(y_true)) < 2:
+            return None
+        return float(roc_auc_score(y_true, probs))
+    except Exception:
+        return None
+
+
 def print_sample_distribution(y_true: np.ndarray, pred: np.ndarray, used_mask: np.ndarray):
     print("\n📊 ================= SAMPLE DISTRIBUTION =================")
 
@@ -59,30 +70,34 @@ def print_sample_distribution(y_true: np.ndarray, pred: np.ndarray, used_mask: n
 
 
 def evaluate_threshold(y_true: np.ndarray, probs: np.ndarray, threshold: float):
-    pred, used_mask = apply_ignore_zone(probs, threshold=threshold)
+    summary = build_threshold_summary(y_true, probs, threshold)
 
     print("\n📊 ================= THRESHOLD EVALUATION =================")
     print(f"🎚️ Threshold: {threshold}")
+    print(
+        f"📈 ROC-AUC (full test, using probs): {summary['roc_auc']:.4f}"
+        if summary["roc_auc"] is not None
+        else "⚠️ ROC-AUC could not be computed."
+    )
+    print(
+        f"✅ Coverage (used samples): {summary['coverage']:.3f}  |  "
+        f"Ignored: {summary['ignored_rate']:.3f}"
+    )
 
-    coverage = float(used_mask.mean())
-    print(f"✅ Coverage (used samples): {coverage:.3f}  |  Ignored: {(1 - coverage):.3f}")
-
-    if used_mask.sum() == 0:
+    if summary["used_samples"] == 0:
         print("⚠️ No samples used at this threshold (everything ignored).")
-        print_sample_distribution(y_true, pred, used_mask)
-        return coverage
+        print_sample_distribution(y_true, summary["pred_all"], summary["used_mask"])
+        return summary["coverage"]
 
-    y_true_used = y_true[used_mask]
-    y_pred_used = pred[used_mask]
+    y_true_used = np.asarray(y_true)[summary["used_mask"]]
+    y_pred_used = summary["pred_used"]
 
-    acc = accuracy_score(y_true_used, y_pred_used)
-    print(f"\n✅ Accuracy (used only): {acc:.4f}")
+    print(f"\n✅ Accuracy (used only): {summary['used_accuracy']:.4f}")
 
-    cm = confusion_matrix(y_true_used, y_pred_used, labels=[0, 1])
     print("\n🔢 Confusion Matrix (used only):")
-    print(cm)
+    print(summary["confusion_matrix"])
 
-    tn, fp, fn, tp = cm.ravel()
+    tn, fp, fn, tp = summary["confusion_matrix"].ravel()
     print(f"""
 True Negatives  (Correct DOWN): {tn}
 False Positives (DOWN → UP):    {fp}
@@ -91,24 +106,26 @@ True Positives  (Correct UP):   {tp}
 """)
 
     print("\n📄 Classification Report (used only):")
-    print(classification_report(
-        y_true_used,
-        y_pred_used,
-        target_names=["DOWN", "UP"],
-        zero_division=0,
-    ))
+    print(
+        classification_report(
+            y_true_used,
+            y_pred_used,
+            target_names=["DOWN", "UP"],
+            zero_division=0,
+        )
+    )
 
-    print_sample_distribution(y_true, pred, used_mask)
-    return coverage
+    print_sample_distribution(y_true, summary["pred_all"], summary["used_mask"])
+    return summary["coverage"]
 
 
 def evaluate_auc(y_true: np.ndarray, probs: np.ndarray):
     print("\n📈 ================= PROBABILITY METRIC =================")
-    try:
-        auc = roc_auc_score(y_true, probs)
-        print(f"📈 ROC-AUC (full test, using probs): {auc:.4f}")
-    except Exception:
+    auc = _safe_roc_auc(y_true, probs)
+    if auc is None:
         print("⚠️ ROC-AUC could not be computed (likely only one class present).")
+    else:
+        print(f"📈 ROC-AUC (full test, using probs): {auc:.4f}")
 
 
 def random_baseline_with_coverage(y_true: np.ndarray, coverage: float, seed: int = 42):
@@ -141,14 +158,22 @@ def majority_baseline_with_coverage(y_true: np.ndarray, coverage: float):
 
 
 def build_threshold_summary(y_true: np.ndarray, probs: np.ndarray, threshold: float) -> dict:
-    pred, used_mask = apply_ignore_zone(probs, threshold=threshold)
+    y_true = np.asarray(y_true).astype(int)
+    probs = np.asarray(probs).astype(float)
 
-    coverage = float(used_mask.mean())
+    pred_raw, used_mask = apply_ignore_zone(probs, threshold=threshold)
+
+    pred_all = np.full(len(probs), 2, dtype=int)  # 2 = sideways
+    pred_all[used_mask] = pred_raw[used_mask]
+
+    coverage = float(used_mask.mean()) if len(used_mask) > 0 else 0.0
     used_samples = int(used_mask.sum())
     total_samples = int(len(y_true))
 
     result = {
+        "threshold_type": "probability",
         "threshold": float(threshold),
+        "roc_auc": _safe_roc_auc(y_true, probs),
         "coverage": coverage,
         "ignored_rate": 1.0 - coverage,
         "used_samples": used_samples,
@@ -159,17 +184,15 @@ def build_threshold_summary(y_true: np.ndarray, probs: np.ndarray, threshold: fl
         "confusion_matrix": None,
         "classification_report_df": None,
         "used_mask": used_mask,
-        "pred_used": None,
+        "pred_used": np.array([], dtype=int),
+        "pred_all": pred_all,
     }
 
     if used_samples == 0:
         return result
 
     y_true_used = y_true[used_mask]
-    y_pred_used = pred[used_mask]
-
-    used_accuracy = float((y_true_used == y_pred_used).mean())
-    cm = confusion_matrix(y_true_used, y_pred_used, labels=[0, 1])
+    y_pred_used = pred_all[used_mask]
 
     report_df = pd.DataFrame(
         classification_report(
@@ -179,16 +202,16 @@ def build_threshold_summary(y_true: np.ndarray, probs: np.ndarray, threshold: fl
             zero_division=0,
             output_dict=True,
         )
-    ).transpose()
+    ).transpose().reset_index().rename(columns={"index": "class"})
 
-    result["used_accuracy"] = used_accuracy
+    result["used_accuracy"] = float((y_true_used == y_pred_used).mean())
     result["random_baseline_accuracy"] = random_baseline_with_coverage(
         y_true, coverage=coverage, seed=42
     )
     result["majority_baseline_accuracy"] = majority_baseline_with_coverage(
         y_true, coverage=coverage
     )
-    result["confusion_matrix"] = cm
+    result["confusion_matrix"] = confusion_matrix(y_true_used, y_pred_used, labels=[0, 1])
     result["classification_report_df"] = report_df
     result["pred_used"] = y_pred_used
 
@@ -230,6 +253,46 @@ def build_distribution_tables(y_true: np.ndarray, used_mask: np.ndarray, pred_us
     return actual_full, actual_used, pred_used_df
 
 
+from sklearn.metrics import precision_score, recall_score, f1_score
+
+
+def build_lstm_threshold_sweep(
+    y_true: np.ndarray,
+    probs: np.ndarray,
+    thresholds: tuple[float, ...] | list[float],
+) -> pd.DataFrame:
+    rows = []
+
+    for threshold in thresholds:
+        summary = build_threshold_summary(
+            y_true=y_true,
+            probs=probs,
+            threshold=float(threshold),
+        )
+
+        if summary["used_samples"] > 0:
+            y_true_used = y_true[summary["used_mask"]]
+            y_pred_used = summary["pred_used"]
+
+            precision = precision_score(y_true_used, y_pred_used, average="macro", zero_division=0)
+            recall = recall_score(y_true_used, y_pred_used, average="macro", zero_division=0)
+            f1 = f1_score(y_true_used, y_pred_used, average="macro", zero_division=0)
+        else:
+            precision = None
+            recall = None
+            f1 = None
+
+        rows.append({
+            "threshold": round(float(threshold), 4),
+            "accuracy": summary["used_accuracy"],
+            "precision_macro": precision,
+            "recall_macro": recall,
+            "f1_macro": f1,
+            "coverage": summary["coverage"],
+        })
+
+    return pd.DataFrame(rows)
+
 def main():
     symbol = "BTCUSDT"
     resolution = "1h"
@@ -238,7 +301,10 @@ def main():
     tag = combo_tag(symbol, resolution)
     save_paths = build_lstm_save_paths(symbol, resolution)
 
-    thresholds = (0.50, 0.51, 0.52, 0.53, 0.54, 0.55, 0.56, 0.57, 0.58)
+    chosen_threshold = 0.58
+    thresholds = (0.50, 0.52, 0.54, 0.56, 0.58, 0.60, 0.62, 0.64, 0.66)
+
+    RUN_TRAIN = False
 
     print("🚀 Starting LSTM Evaluation...\n")
     print(f"Symbol:      {symbol}")
@@ -246,59 +312,124 @@ def main():
     print(f"Start date:  {start_date}")
     print(f"Combo tag:   {tag}")
     print(f"Model path:  {save_paths['model_path']}")
+    print(f"Artifacts:   {save_paths['artifacts_path']}")
+    print(f"Test probs:  {save_paths['test_probs_path']}")
     print()
 
-    model, history, probs_df, metrics_df, scaler = train_lstm_model(
-        symbol=symbol,
-        resolution=resolution,
-        start_date=start_date,
-        end_date=None,
-        x_window_size=100,
-        epochs=10,
-        batch_size=64,
-        train_ratio=0.80,
-        validation_split=0.05,
-        learning_rate=0.001,
-        lstm_units=100,
-        dropout_rate=0.20,
-        early_stopping_patience=3,
-        model_path=save_paths["model_path"],
-        scaler_path=save_paths["scaler_path"],
-        artifacts_path=save_paths["artifacts_path"],
-        test_probs_path=save_paths["test_probs_path"],
-        metrics_path=save_paths["metrics_path"],
-        thresholds=thresholds,
-    )
-
-    print("\n================ TRAINING SUMMARY ================")
-    if "accuracy" in history.history:
-        print(f"Final Training Accuracy:   {history.history['accuracy'][-1]:.4f}")
-    if "val_accuracy" in history.history:
-        print(f"Final Validation Accuracy: {history.history['val_accuracy'][-1]:.4f}")
+    if RUN_TRAIN:
+        model, history, probs_df, metrics_df, scaler = train_lstm_model(
+            symbol=symbol,
+            resolution=resolution,
+            start_date=start_date,
+            end_date=None,
+            x_window_size=100,
+            epochs=10,
+            batch_size=64,
+            train_ratio=0.80,
+            validation_split=0.05,
+            learning_rate=0.001,
+            lstm_units=100,
+            dropout_rate=0.20,
+            early_stopping_patience=3,
+            model_path=save_paths["model_path"],
+            scaler_path=save_paths["scaler_path"],
+            artifacts_path=save_paths["artifacts_path"],
+            test_probs_path=save_paths["test_probs_path"],
+            metrics_path=save_paths["metrics_path"],
+            thresholds=thresholds,
+        )
+    else:
+        print("📂 Skipping training. Loading saved test probabilities...")
+        probs_df = pd.read_csv(save_paths["test_probs_path"])
+        history = None
 
     y_true = probs_df["y_true"].values.astype(int)
     probs = probs_df["p"].values.astype(float)
 
-    evaluate_auc(y_true, probs)
+    auc = _safe_roc_auc(y_true, probs)
 
-    print("\n📊 ================= THRESHOLDS + BASELINES =================")
-    for t in thresholds:
-        print("\n" + "=" * 55)
+    print("\n📈 ================= PROBABILITY METRIC =================")
+    if auc is None:
+        print("⚠️ ROC-AUC could not be computed.")
+    else:
+        print(f"📈 ROC-AUC (full test, using probs): {auc:.4f}")
 
-        coverage = evaluate_threshold(y_true, probs, threshold=t)
+    # 1) RAW RESULTS
+    raw_pred = (probs >= 0.5).astype(int)
+    raw_acc = accuracy_score(y_true, raw_pred)
+    raw_cm = confusion_matrix(y_true, raw_pred, labels=[0, 1])
 
-        rand_acc = random_baseline_with_coverage(y_true, coverage=coverage, seed=42)
-        maj_acc = majority_baseline_with_coverage(y_true, coverage=coverage)
+    print("\n📊 ================= RAW RESULTS =================")
+    print("Threshold:         0.50")
+    print(f"Accuracy:          {raw_acc:.4f}")
 
-        print("\n📌 Baselines (matched coverage):")
-        print("Random Baseline Accuracy:  ", "nan" if np.isnan(rand_acc) else f"{rand_acc:.4f}")
-        print("Majority Baseline Accuracy:", "nan" if np.isnan(maj_acc) else f"{maj_acc:.4f}")
+    print("\n🔢 Confusion Matrix:")
+    print(raw_cm)
+
+    print("\n📄 Classification Report:")
+    print(classification_report(
+        y_true,
+        raw_pred,
+        labels=[0, 1],
+        target_names=["DOWN", "UP"],
+        zero_division=0,
+    ))
+
+    # 2) CHOSEN CONFIGURATION
+    summary = build_threshold_summary(
+        y_true=y_true,
+        probs=probs,
+        threshold=chosen_threshold,
+    )
+
+    print("\n📊 ================= CHOSEN CONFIGURATION =================")
+    print(f"Threshold:         {chosen_threshold}")
+    print(f"Coverage:          {summary['coverage']:.4f}")
+    print(f"Ignored rate:      {summary['ignored_rate']:.4f}")
+    print(f"Used samples:      {summary['used_samples']} / {summary['total_samples']}")
+    print(
+        f"Used accuracy:     {summary['used_accuracy']:.4f}"
+        if summary["used_accuracy"] is not None
+        else "Used accuracy:     None"
+    )
+
+    if summary["confusion_matrix"] is not None:
+        print("\n🔢 Confusion Matrix (used only):")
+        print(summary["confusion_matrix"])
+
+    if summary["classification_report_df"] is not None:
+        print("\n📄 Classification Report (used only):")
+        print(summary["classification_report_df"])
+
+    actual_full, actual_used, pred_used_df = build_distribution_tables(
+        y_true=y_true,
+        used_mask=summary["used_mask"],
+        pred_used=summary["pred_used"],
+    )
+
+    print("\n📊 Actual distribution (full test):")
+    print(actual_full)
+
+    print("\n📊 Actual distribution (used only):")
+    print(actual_used)
+
+    print("\n📊 Predicted distribution (used only):")
+    print(pred_used_df)
+
+    # 3) ACCURACY ACROSS THRESHOLDS
+    print("\n📊 ================= ACCURACY ACROSS THRESHOLDS =================")
+    sweep_df = build_lstm_threshold_sweep(
+        y_true=y_true,
+        probs=probs,
+        thresholds=thresholds,
+    )
+    print(sweep_df)
 
     print("\n📊 Test probs preview:")
     print(probs_df.head())
     print(f"\nTotal test samples: {len(probs_df)}")
 
-    print("\n✅ Full evaluation completed successfully")
+    print("\n✅ Full LSTM evaluation completed successfully")
     print(f"✅ Saved combination files for: {tag}")
 
 

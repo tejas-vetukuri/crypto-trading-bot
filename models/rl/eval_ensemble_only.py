@@ -6,6 +6,8 @@ from dataclasses import replace
 import numpy as np
 import pandas as pd
 
+from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score
+
 from data.binance import BinanceDataClient
 
 from models.rl.rl_ensemble import (
@@ -14,10 +16,23 @@ from models.rl.rl_ensemble import (
     build_direction_from_ensemble,
     simulate_trade_outcome,
 )
+from models.lstm.lstm import build_lstm_save_paths
+from models.xgboost.xgb import build_xgb_save_paths
 
 
 def _safe_mean(x):
     return float(np.mean(x)) if len(x) else 0.0
+
+
+def _safe_roc_auc(y_true, probs):
+    try:
+        y_true = np.asarray(y_true).astype(int)
+        probs = np.asarray(probs).astype(float)
+        if len(np.unique(y_true)) < 2:
+            return None
+        return float(roc_auc_score(y_true, probs))
+    except Exception:
+        return None
 
 
 def _evaluate_binary_model(actual, pred, mask=None):
@@ -181,17 +196,22 @@ def evaluate_ensemble_only(
     start_date: str = "2019-06-01",
     end_date: str | None = None,
     train_ratio: float = 0.80,
-    xgb_artifacts_path: str = "models/xgboost/xgb_trend_artifacts.joblib",
-    lstm_artifacts_path: str = "models/lstm/lstm_artifacts.joblib",
-    lstm_threshold: float = 0.52,
+    xgb_artifacts_path: str | None = None,
+    lstm_artifacts_path: str | None = None,
+    lstm_threshold: float = 0.53,
     risk: RiskConfig = RiskConfig(),
     ensemble_weight_xgb: float = 0.8,
     ensemble_weight_lstm: float = 0.2,
-    ensemble_upper: float = 0.60,
-    ensemble_lower: float = 0.40,
+    ensemble_decision_boundary: float = 0.50,
+    ensemble_margin: float = 0.10,
     max_horizon: int = 3,
     verbose: bool = True,
 ) -> dict:
+    if xgb_artifacts_path is None:
+        xgb_artifacts_path = str(build_xgb_save_paths(symbol, resolution)["artifacts_path"])
+    if lstm_artifacts_path is None:
+        lstm_artifacts_path = str(build_lstm_save_paths(symbol, resolution)["artifacts_path"])
+
     client = BinanceDataClient()
     df_raw = client.get_candles(
         symbol=symbol,
@@ -214,7 +234,7 @@ def evaluate_ensemble_only(
         lstm_threshold=lstm_threshold,
     ).copy()
 
-    actual = merged["actual"].values
+    actual = merged["actual"].values.astype(int)
 
     xgb_mask = merged["xgb_pred"].values != 2
     xgb_acc_non_hold, xgb_n = _evaluate_binary_model(
@@ -234,12 +254,28 @@ def evaluate_ensemble_only(
     if weight_sum <= 0:
         raise ValueError("ensemble_weight_xgb + ensemble_weight_lstm must be > 0")
 
+    if not (0.0 < ensemble_decision_boundary < 1.0):
+        raise ValueError("ensemble_decision_boundary must be between 0 and 1")
+
+    if ensemble_margin < 0:
+        raise ValueError("ensemble_margin must be >= 0")
+
+    ensemble_upper = ensemble_decision_boundary + ensemble_margin
+    ensemble_lower = ensemble_decision_boundary - ensemble_margin
+
+    if ensemble_lower < 0.0 or ensemble_upper > 1.0:
+        raise ValueError(
+            "ensemble_decision_boundary ± ensemble_margin must stay within [0, 1]"
+        )
+
     p_ens = (
         ensemble_weight_xgb * merged["xgb_p_up"].values
         + ensemble_weight_lstm * merged["lstm_p_up"].values
     ) / weight_sum
 
-    ens_pred_2way = (p_ens >= 0.5).astype(int)
+    ens_raw_roc_auc = _safe_roc_auc(actual, p_ens)
+
+    ens_pred_2way = (p_ens >= ensemble_decision_boundary).astype(int)
     ens_acc_2way, ens_n_2way = _evaluate_binary_model(actual=actual, pred=ens_pred_2way)
 
     ens_pred_3way = np.where(
@@ -248,6 +284,33 @@ def evaluate_ensemble_only(
         np.where(p_ens <= ensemble_lower, 0, 2),
     )
     ens_acc_non_hold, ens_n_non_hold = _evaluate_three_way_non_hold(actual, ens_pred_3way)
+
+    used_mask = ens_pred_3way != 2
+    if used_mask.sum() > 0:
+        actual_used = actual[used_mask]
+        ens_pred_used = ens_pred_3way[used_mask]
+
+        ens_used_confusion_matrix = confusion_matrix(actual_used, ens_pred_used, labels=[0, 1])
+        ens_used_classification_report_df = (
+            pd.DataFrame(
+                classification_report(
+                    actual_used,
+                    ens_pred_used,
+                    labels=[0, 1],
+                    target_names=["DOWN", "UP"],
+                    zero_division=0,
+                    output_dict=True,
+                )
+            )
+            .transpose()
+            .reset_index()
+            .rename(columns={"index": "class"})
+        )
+    else:
+        actual_used = np.array([], dtype=int)
+        ens_pred_used = np.array([], dtype=int)
+        ens_used_confusion_matrix = None
+        ens_used_classification_report_df = None
 
     xgb_dir = (merged["xgb_p_up"].values >= 0.5).astype(int)
     lstm_dir = (merged["lstm_p_up"].values >= 0.5).astype(int)
@@ -300,10 +363,15 @@ def evaluate_ensemble_only(
             "ensemble_2way_n": ens_n_2way,
             "ensemble_3way_accuracy_non_hold": ens_acc_non_hold,
             "ensemble_3way_n_non_hold": ens_n_non_hold,
+            "ensemble_raw_roc_auc": ens_raw_roc_auc,
+            "ensemble_used_confusion_matrix": ens_used_confusion_matrix,
+            "ensemble_used_classification_report_df": ens_used_classification_report_df,
             "agreement_only_accuracy": agree_acc,
             "agreement_only_n": agree_n,
             "ensemble_weight_xgb": ensemble_weight_xgb,
             "ensemble_weight_lstm": ensemble_weight_lstm,
+            "ensemble_decision_boundary": ensemble_decision_boundary,
+            "ensemble_margin": ensemble_margin,
             "ensemble_upper": ensemble_upper,
             "ensemble_lower": ensemble_lower,
         },
@@ -324,9 +392,33 @@ def evaluate_ensemble_only(
         print("\n---------------- Raw Ensemble ----------------")
         print(f"Ensemble 2-way accuracy:         {ens_acc_2way:.4f}  | n={ens_n_2way}")
         print(f"Ensemble 3-way acc (non-hold):   {ens_acc_non_hold:.4f} | n={ens_n_non_hold}")
+        if ens_raw_roc_auc is None:
+            print("Ensemble ROC-AUC (raw):          None")
+        else:
+            print(f"Ensemble ROC-AUC (raw):          {ens_raw_roc_auc:.4f}")
         print(f"Agreement-only accuracy:         {agree_acc:.4f}  | n={agree_n}")
         print(f"Ensemble weights:                xgb={ensemble_weight_xgb:.2f}, lstm={ensemble_weight_lstm:.2f}")
+        print(f"Ensemble decision boundary:      {ensemble_decision_boundary:.2f}")
+        print(f"Ensemble margin:                 {ensemble_margin:.2f}")
         print(f"Ensemble hold band:              [{ensemble_lower:.2f}, {ensemble_upper:.2f}]")
+
+        if ens_used_confusion_matrix is not None:
+            print("\nConfusion Matrix (used only):")
+            print(ens_used_confusion_matrix)
+
+        if used_mask.sum() > 0:
+            print("\nClassification Report (used only):")
+            print(
+                classification_report(
+                    actual_used,
+                    ens_pred_used,
+                    labels=[0, 1],
+                    target_names=["DOWN", "UP"],
+                    zero_division=0,
+                )
+            )
+        else:
+            print("\nNo non-hold ensemble predictions available.")
 
         _print_trade_block(
             title="Ensemble-Only Trade Simulation",
@@ -340,15 +432,21 @@ def evaluate_ensemble_only(
 
 
 if __name__ == "__main__":
+    symbol = "BTCUSDT"
+    resolution = "1h"
+
+    xgb_paths = build_xgb_save_paths(symbol, resolution)
+    lstm_paths = build_lstm_save_paths(symbol, resolution)
+
     evaluate_ensemble_only(
-        symbol="BTCUSDT",
-        resolution="1h",
+        symbol=symbol,
+        resolution=resolution,
         start_date="2017-09-01",
         end_date=None,
         train_ratio=0.80,
-        xgb_artifacts_path="models/xgboost/xgb_trend_artifacts.joblib",
-        lstm_artifacts_path="models/lstm/lstm_artifacts.joblib",
-        lstm_threshold=0.53,
+        xgb_artifacts_path=str(xgb_paths["artifacts_path"]),
+        lstm_artifacts_path=str(lstm_paths["artifacts_path"]),
+        lstm_threshold=0.58,
         risk=RiskConfig(
             capital_usd=5000.0,
             risk_per_trade=0.02,
@@ -361,8 +459,8 @@ if __name__ == "__main__":
         ),
         ensemble_weight_xgb=0.8,
         ensemble_weight_lstm=0.2,
-        ensemble_upper=0.60,
-        ensemble_lower=0.40,
+        ensemble_decision_boundary=0.48,
+        ensemble_margin=0.10,
         max_horizon=3,
         verbose=True,
     )

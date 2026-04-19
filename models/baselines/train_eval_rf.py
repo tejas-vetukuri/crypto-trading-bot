@@ -3,7 +3,19 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.metrics import (
+    accuracy_score,
+    classification_report,
+    confusion_matrix,
+    roc_auc_score,
+)
+
+from models.baselines.randomforest import (
+    train_rf_model,
+    get_default_start_date,
+    combo_tag,
+    build_rf_save_paths,
+)
 
 
 def _safe_accuracy(y_true: np.ndarray, y_pred: np.ndarray):
@@ -15,8 +27,19 @@ def _safe_accuracy(y_true: np.ndarray, y_pred: np.ndarray):
 def _safe_majority_baseline(y_true: np.ndarray):
     if len(y_true) == 0:
         return None
-    vals, counts = np.unique(y_true, return_counts=True)
+    _, counts = np.unique(y_true, return_counts=True)
     return float(counts.max() / counts.sum())
+
+
+def _safe_roc_auc(y_true: np.ndarray, probs: np.ndarray):
+    try:
+        y_true = np.asarray(y_true).astype(int)
+        probs = np.asarray(probs).astype(float)
+        if len(np.unique(y_true)) < 2:
+            return None
+        return float(roc_auc_score(y_true, probs))
+    except Exception:
+        return None
 
 
 def build_rf_eval_summary(
@@ -27,6 +50,8 @@ def build_rf_eval_summary(
 ) -> dict:
     y_true = np.asarray(y_true).astype(int)
     p_up = np.asarray(p_up).astype(float)
+
+    auc_roc = _safe_roc_auc(y_true, p_up)
 
     margin = np.abs(p_up - float(decision_boundary))
     used_mask = margin >= float(margin_threshold)
@@ -52,7 +77,7 @@ def build_rf_eval_summary(
             y_used,
             pred_used,
             labels=[0, 1],
-            target_names=["down", "up"],
+            target_names=["DOWN", "UP"],
             output_dict=True,
             zero_division=0,
         )
@@ -70,6 +95,7 @@ def build_rf_eval_summary(
         "used_samples": used_samples,
         "total_samples": total_samples,
         "used_accuracy": used_accuracy,
+        "auc_roc": auc_roc,
         "random_baseline_accuracy": random_baseline_accuracy,
         "majority_baseline_accuracy": majority_baseline_accuracy,
         "used_mask": used_mask,
@@ -103,6 +129,7 @@ def build_rf_margin_sweep(
             "used_samples": summary["used_samples"],
             "total_samples": summary["total_samples"],
             "used_accuracy": summary["used_accuracy"],
+            "auc_roc": summary["auc_roc"],
             "random_baseline_accuracy": summary["random_baseline_accuracy"],
             "majority_baseline_accuracy": summary["majority_baseline_accuracy"],
         })
@@ -145,3 +172,76 @@ def build_rf_distribution_tables(
     })
 
     return actual_full, actual_used, pred_used_df
+
+
+def main():
+    symbol = "BTCUSDT"
+    resolution = "1h"
+
+    start_date = get_default_start_date(resolution)
+    tag = combo_tag(symbol, resolution)
+    save_paths = build_rf_save_paths(symbol, resolution)
+
+    print("🚀 Starting Random Forest Baseline Evaluation...\n")
+    print(f"Symbol:      {symbol}")
+    print(f"Resolution:  {resolution}")
+    print(f"Start date:  {start_date}")
+    print(f"Combo tag:   {tag}")
+    print(f"Artifacts:   {save_paths['artifacts_path']}")
+    print(f"Preds CSV:   {save_paths['preds_csv_path']}")
+    print()
+
+    model, artifacts, preds_df = train_rf_model(
+        symbol=symbol,
+        resolution=resolution,
+        start_date=start_date,
+        end_date=None,
+        train_ratio=0.80,
+        decision_boundary=0.50,
+        margin_threshold=0.00,
+        artifacts_path=save_paths["artifacts_path"],
+        preds_csv_path=save_paths["preds_csv_path"],
+        n_estimators=300,
+        max_depth=8,
+        min_samples_split=10,
+        min_samples_leaf=3,
+        max_features="sqrt",
+    )
+
+    y_true = (preds_df["actual_trend"].astype(str).str.lower() == "up").astype(int).values
+    p_up = preds_df["p_up"].astype(float).values
+    y_pred = (p_up >= 0.5).astype(int)
+
+    acc = accuracy_score(y_true, y_pred)
+    auc = _safe_roc_auc(y_true, p_up)
+    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+
+    print("\n📈 ================= RAW RESULTS =================")
+    print(f"✅ Accuracy: {acc:.4f}")
+    if auc is None:
+        print("📈 ROC-AUC: could not be computed")
+    else:
+        print(f"📈 ROC-AUC: {auc:.4f}")
+
+    print("\n🔢 Confusion Matrix:")
+    print(cm)
+
+    print("\n📄 Classification Report:")
+    print(classification_report(
+        y_true,
+        y_pred,
+        labels=[0, 1],
+        target_names=["DOWN", "UP"],
+        zero_division=0,
+    ))
+
+    print("\n📊 Predictions preview:")
+    print(preds_df.head())
+    print(f"\nTotal test samples: {len(preds_df)}")
+
+    print("\n✅ Random Forest raw evaluation completed successfully")
+    print(f"✅ Saved combination files for: {artifacts['combo_tag']}")
+
+
+if __name__ == "__main__":
+    main()
