@@ -1,7 +1,7 @@
 from models.rl.rl_ensemble import train_rl_policy, RiskConfig
 
 SYMBOLS = ["BTCUSDT", "ETHUSDT"]
-TIMEFRAMES = ["5m", "15m"]
+TIMEFRAMES = ["5m", "15m", "1h", "4h"]
 
 if __name__ == "__main__":
     print("\n========== RL BATCH TRAIN ==========\n")
