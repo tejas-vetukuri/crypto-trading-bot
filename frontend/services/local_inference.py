@@ -1,17 +1,94 @@
 from __future__ import annotations
 
 
+NEUTRAL_DIRECTIONS = {"SIDEWAYS", "HOLD", "NEUTRAL", "MIXED", ""}
+
+
+def normalise_direction(label: object) -> str:
+    """
+    Model outputs should be represented as UP / DOWN / SIDEWAYS.
+    Trading actions should remain LONG / SHORT / HOLD.
+    """
+    label = str(label or "").upper().strip()
+
+    mapping = {
+        "LONG": "UP",
+        "BUY": "UP",
+        "BULLISH": "UP",
+        "BULL": "UP",
+        "SHORT": "DOWN",
+        "SELL": "DOWN",
+        "BEARISH": "DOWN",
+        "BEAR": "DOWN",
+        "HOLD": "SIDEWAYS",
+        "NEUTRAL": "SIDEWAYS",
+        "MIXED": "SIDEWAYS",
+        "": "SIDEWAYS",
+    }
+
+    return mapping.get(label, label)
+
+
+def normalise_action(label: object) -> str:
+    """
+    Final RL/trade action should be represented as LONG / SHORT / HOLD.
+    """
+    label = str(label or "").upper().strip()
+
+    mapping = {
+        "UP": "LONG",
+        "BUY": "LONG",
+        "BULLISH": "LONG",
+        "BULL": "LONG",
+        "DOWN": "SHORT",
+        "SELL": "SHORT",
+        "BEARISH": "SHORT",
+        "BEAR": "SHORT",
+        "SIDEWAYS": "HOLD",
+        "NEUTRAL": "HOLD",
+        "MIXED": "HOLD",
+        "": "HOLD",
+    }
+
+    return mapping.get(label, label)
+
+
+def to_float(value: object) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def safe_sum_r(recent_trades) -> float:
+    total = 0.0
+    for trade in recent_trades:
+        value = to_float(trade.get("r", 0.0))
+        total += value if value is not None else 0.0
+    return total
+
+
+def is_directional(label: str) -> bool:
+    return label in {"UP", "DOWN"}
+
+
 def generate_local_inference(predictions, sentiment=None, recent_trades=None):
-    lstm = str(predictions.get("lstm_label", "")).upper().strip()
-    xgb = str(predictions.get("xgb_label", "")).upper().strip()
-    ensemble = str(predictions.get("ensemble_direction", "")).upper().strip()
-    final_action = str(predictions.get("final_action", "")).upper().strip()
+    predictions = predictions or {}
+
+    lstm = normalise_direction(predictions.get("lstm_label"))
+    xgb = normalise_direction(predictions.get("xgb_label"))
+    ensemble = normalise_direction(predictions.get("ensemble_direction"))
+    final_action = normalise_action(predictions.get("final_action"))
     rl_reason = str(predictions.get("rl_reason", "")).lower().strip()
 
-    lstm_conf = predictions.get("lstm_confidence")
-    xgb_conf = predictions.get("xgb_confidence")
-    ens_conf = predictions.get("ensemble_confidence")
-    policy_score = predictions.get("policy_score")
+    # Enforce consistency if RL was skipped or unavailable.
+    if rl_reason in {"ensemble_no_setup", "rl_agent_not_loaded"}:
+        final_action = "HOLD"
+
+    lstm_conf = to_float(predictions.get("lstm_confidence"))
+    xgb_conf = to_float(predictions.get("xgb_confidence"))
+    ens_conf = to_float(predictions.get("ensemble_confidence"))
+    policy_score = to_float(predictions.get("policy_score"))
 
     headline = "Mixed setup"
     summary_parts = []
@@ -21,6 +98,7 @@ def generate_local_inference(predictions, sentiment=None, recent_trades=None):
     rl_reason_parts = []
     sentiment_reason_parts = []
     trade_reason_parts = []
+
     confidence_note = "Overall conviction is moderate."
     risk_note = (
         "This is a rule-based interpretation of model outputs and recent replay context, "
@@ -28,109 +106,142 @@ def generate_local_inference(predictions, sentiment=None, recent_trades=None):
     )
 
     # Headline
-    if final_action in ["LONG", "SHORT"]:
+    if final_action in {"LONG", "SHORT"}:
         headline = f"RL approves {final_action} setup"
-    elif ensemble in ["UP", "DOWN"] and final_action in ["HOLD", "SIDEWAYS", ""]:
+    elif is_directional(ensemble) and final_action == "HOLD":
         headline = "Directional setup filtered by RL"
-    elif ensemble in ["SIDEWAYS", "HOLD", "NEUTRAL", "MIXED", ""]:
+    elif ensemble == "SIDEWAYS":
         headline = "Low-conviction setup"
     else:
         headline = "Mixed setup"
 
     # Summary
-    if lstm == xgb and lstm not in ["SIDEWAYS", "HOLD", "NEUTRAL", "MIXED", ""]:
+    if lstm == xgb and is_directional(lstm):
         summary_parts.append(
             f"LSTM and XGBoost both lean {lstm}, so the raw directional signal is aligned."
         )
-    elif lstm != xgb:
+    elif is_directional(lstm) and is_directional(xgb) and lstm != xgb:
         summary_parts.append(
             f"LSTM ({lstm}) and XGBoost ({xgb}) disagree, which reduces clarity."
         )
     else:
         summary_parts.append(
-            "At least one model is neutral, so the setup lacks strong directional agreement."
+            "At least one model is sideways, so the setup lacks strong directional agreement."
         )
 
-    if ensemble in ["UP", "DOWN"]:
-        summary_parts.append(f"The ensemble resolves to {ensemble}.")
+    if ensemble == "UP":
+        summary_parts.append("The ensemble resolves to UP.")
+    elif ensemble == "DOWN":
+        summary_parts.append("The ensemble resolves to DOWN.")
     else:
-        summary_parts.append("The ensemble remains sideways/neutral.")
+        summary_parts.append("The ensemble remains SIDEWAYS.")
 
-    if final_action in ["LONG", "SHORT"]:
+    if final_action in {"LONG", "SHORT"}:
         summary_parts.append(f"RL allows a {final_action} action.")
     else:
         summary_parts.append("RL does not approve an active trade.")
 
     # LSTM reason
     lstm_reason_parts.append(f"LSTM output is {lstm}.")
-    if lstm in ["SIDEWAYS", "HOLD", "NEUTRAL", "MIXED", ""]:
+    if lstm == "SIDEWAYS":
         lstm_reason_parts.append(
             "This suggests the sequence model does not see a strong short-term directional edge."
         )
+    elif lstm == "UP":
+        lstm_reason_parts.append(
+            "This suggests the sequence model sees short-term upward momentum or continuation."
+        )
+    elif lstm == "DOWN":
+        lstm_reason_parts.append(
+            "This suggests the sequence model sees short-term downward momentum or continuation."
+        )
     else:
         lstm_reason_parts.append(
-            "This suggests the sequence model sees short-term momentum or continuation in that direction."
+            "This output is not recognised as a standard UP, DOWN, or SIDEWAYS direction."
         )
 
     if lstm_conf is not None:
-        if lstm in ["SIDEWAYS", "HOLD", "NEUTRAL", "MIXED"]:
-            lstm_reason_parts.append("Confidence is intentionally suppressed for a neutral prediction.")
-        elif lstm_conf >= 0.70:
-            lstm_reason_parts.append(f"Confidence is relatively strong at {lstm_conf:.2%}.")
-        elif lstm_conf >= 0.55:
-            lstm_reason_parts.append(f"Confidence is moderate at {lstm_conf:.2%}.")
-        else:
-            lstm_reason_parts.append(f"Confidence is weak at {lstm_conf:.2%}, so conviction is limited.")
+        if lstm == "SIDEWAYS":
+            lstm_reason_parts.append(
+                "Confidence is not emphasised because the prediction is sideways."
+            )
+        elif is_directional(lstm):
+            if lstm_conf >= 0.70:
+                lstm_reason_parts.append(f"Confidence is relatively strong at {lstm_conf:.2%}.")
+            elif lstm_conf >= 0.55:
+                lstm_reason_parts.append(f"Confidence is moderate at {lstm_conf:.2%}.")
+            else:
+                lstm_reason_parts.append(
+                    f"Confidence is weak at {lstm_conf:.2%}, so conviction is limited."
+                )
 
-    # XGB reason
+    # XGBoost reason
     xgb_reason_parts.append(f"XGBoost output is {xgb}.")
-    if xgb in ["SIDEWAYS", "HOLD", "NEUTRAL", "MIXED", ""]:
+    if xgb == "SIDEWAYS":
         xgb_reason_parts.append(
-            "This suggests the tabular feature set does not currently favor a clear directional trade."
+            "This suggests the tabular feature set does not currently favour a clear directional trade."
+        )
+    elif xgb == "UP":
+        xgb_reason_parts.append(
+            "This suggests the engineered feature snapshot favours upward movement."
+        )
+    elif xgb == "DOWN":
+        xgb_reason_parts.append(
+            "This suggests the engineered feature snapshot favours downward movement."
         )
     else:
         xgb_reason_parts.append(
-            "This suggests the engineered feature snapshot favors that direction."
+            "This output is not recognised as a standard UP, DOWN, or SIDEWAYS direction."
         )
 
     if xgb_conf is not None:
-        if xgb in ["SIDEWAYS", "HOLD", "NEUTRAL", "MIXED"]:
-            xgb_reason_parts.append("Confidence is intentionally suppressed for a neutral prediction.")
-        elif xgb_conf >= 0.70:
-            xgb_reason_parts.append(f"Confidence is relatively strong at {xgb_conf:.2%}.")
-        elif xgb_conf >= 0.55:
-            xgb_reason_parts.append(f"Confidence is moderate at {xgb_conf:.2%}.")
-        else:
-            xgb_reason_parts.append(f"Confidence is weak at {xgb_conf:.2%}, so the edge is not strong.")
+        if xgb == "SIDEWAYS":
+            xgb_reason_parts.append(
+                "Confidence is not emphasised because the prediction is sideways."
+            )
+        elif is_directional(xgb):
+            if xgb_conf >= 0.70:
+                xgb_reason_parts.append(f"Confidence is relatively strong at {xgb_conf:.2%}.")
+            elif xgb_conf >= 0.55:
+                xgb_reason_parts.append(f"Confidence is moderate at {xgb_conf:.2%}.")
+            else:
+                xgb_reason_parts.append(
+                    f"Confidence is weak at {xgb_conf:.2%}, so the edge is not strong."
+                )
 
     # Ensemble reason
-    if lstm == xgb and lstm not in ["SIDEWAYS", "HOLD", "NEUTRAL", "MIXED", ""]:
+    if lstm == xgb and is_directional(lstm):
         ensemble_reason_parts.append(
             "Because both base models point the same way, the ensemble has cleaner directional agreement."
         )
-    elif lstm != xgb:
+    elif is_directional(lstm) and is_directional(xgb) and lstm != xgb:
         ensemble_reason_parts.append(
             "Because the base models disagree, the ensemble result should be treated with more caution."
         )
     else:
         ensemble_reason_parts.append(
-            "Neutral output from at least one base model lowers ensemble conviction."
+            "Sideways output from at least one base model lowers ensemble conviction."
         )
 
     if ens_conf is not None:
-        if ensemble in ["SIDEWAYS", "HOLD", "NEUTRAL", "MIXED", ""]:
-            ensemble_reason_parts.append("Ensemble confidence is hidden because the combined output is neutral.")
-        elif ens_conf >= 0.70:
-            ensemble_reason_parts.append(f"Ensemble confidence is strong at {ens_conf:.2%}.")
-        elif ens_conf >= 0.55:
-            ensemble_reason_parts.append(f"Ensemble confidence is moderate at {ens_conf:.2%}.")
-        else:
-            ensemble_reason_parts.append(f"Ensemble confidence is weak at {ens_conf:.2%}.")
+        if ensemble == "SIDEWAYS":
+            ensemble_reason_parts.append(
+                "Ensemble confidence is not emphasised because the combined output is sideways."
+            )
+        elif is_directional(ensemble):
+            if ens_conf >= 0.70:
+                ensemble_reason_parts.append(f"Ensemble confidence is strong at {ens_conf:.2%}.")
+            elif ens_conf >= 0.55:
+                ensemble_reason_parts.append(f"Ensemble confidence is moderate at {ens_conf:.2%}.")
+            else:
+                ensemble_reason_parts.append(f"Ensemble confidence is weak at {ens_conf:.2%}.")
 
-    if ensemble in ["UP", "DOWN"]:
-        ensemble_reason_parts.append(f"The combined directional outcome is {ensemble}.")
+    if ensemble == "UP":
+        ensemble_reason_parts.append("The combined directional outcome is UP.")
+    elif ensemble == "DOWN":
+        ensemble_reason_parts.append("The combined directional outcome is DOWN.")
     else:
-        ensemble_reason_parts.append("The combined directional outcome is sideways/hold.")
+        ensemble_reason_parts.append("The combined directional outcome is SIDEWAYS.")
 
     # RL reason
     if rl_reason == "ensemble_no_setup":
@@ -139,10 +250,10 @@ def generate_local_inference(predictions, sentiment=None, recent_trades=None):
         )
     elif rl_reason == "rl_agent_not_loaded":
         rl_reason_parts.append(
-            "RL filtering is unavailable, so the final display falls back to the ensemble signal."
+            "RL filtering is unavailable, so the output should be interpreted without learned RL validation."
         )
     else:
-        if final_action in ["LONG", "SHORT"]:
+        if final_action in {"LONG", "SHORT"}:
             rl_reason_parts.append(
                 f"RL accepts a {final_action} trade, meaning the learned policy considers the current state tradable."
             )
@@ -157,11 +268,11 @@ def generate_local_inference(predictions, sentiment=None, recent_trades=None):
     # Sentiment reason
     if sentiment:
         bias = str(sentiment.get("sentiment", "UNKNOWN")).upper().strip()
-        oi_change = sentiment.get("oi_change_pct")
-        lsr = sentiment.get("lsr_ratio")
-        long_ratio = sentiment.get("long_ratio")
-        short_ratio = sentiment.get("short_ratio")
-        price_change = sentiment.get("price_change_pct")
+        oi_change = to_float(sentiment.get("oi_change_pct"))
+        lsr = to_float(sentiment.get("lsr_ratio"))
+        long_ratio = to_float(sentiment.get("long_ratio"))
+        short_ratio = to_float(sentiment.get("short_ratio"))
+        price_change = to_float(sentiment.get("price_change_pct"))
         bias_reason = sentiment.get("reason", "")
 
         sentiment_reason_parts.append(f"Sentiment block reads {bias}.")
@@ -206,13 +317,17 @@ def generate_local_inference(predictions, sentiment=None, recent_trades=None):
         total = len(recent_trades)
         wins = sum(1 for t in recent_trades if str(t.get("outcome", "")).upper() == "WIN")
         losses = sum(1 for t in recent_trades if str(t.get("outcome", "")).upper() == "LOSS")
-        breakevens = sum(1 for t in recent_trades if str(t.get("outcome", "")).upper() == "BREAKEVEN")
-        net_r = sum(float(t.get("r", 0.0)) for t in recent_trades)
+        breakevens = sum(
+            1 for t in recent_trades if str(t.get("outcome", "")).upper() == "BREAKEVEN"
+        )
+
+        net_r = safe_sum_r(recent_trades)
         avg_r = net_r / total if total else 0.0
-        win_pct = (wins / total * 100.0) if total else 0.0
+        win_pct = wins / total * 100.0 if total else 0.0
 
         trade_reason_parts.append(
-            f"Across the last {total} RL replay trades, win rate is {win_pct:.1f}% with net R of {net_r:+.2f}R and average R of {avg_r:+.2f}R."
+            f"Across the last {total} RL replay trades, win rate is {win_pct:.1f}% "
+            f"with net R of {net_r:+.2f}R and average R of {avg_r:+.2f}R."
         )
         trade_reason_parts.append(
             f"Resolved outcomes: {wins} wins, {losses} losses, {breakevens} breakevens."
@@ -234,8 +349,8 @@ def generate_local_inference(predictions, sentiment=None, recent_trades=None):
         trade_reason_parts.append("No recent RL replay trades are available for contextual validation.")
 
     # Confidence note
-    if final_action in ["LONG", "SHORT"]:
-        if ens_conf is not None and ens_conf >= 0.70 and lstm == xgb:
+    if final_action in {"LONG", "SHORT"}:
+        if ens_conf is not None and ens_conf >= 0.70 and lstm == xgb and is_directional(lstm):
             confidence_note = (
                 "Overall conviction is relatively strong because model agreement and ensemble confidence both support the setup."
             )
